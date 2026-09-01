@@ -138,10 +138,9 @@ def reward_lin_vel_z(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ) -> torch.Tensor: 
     parkour_event: ParkourEvent =  env.parkour_manager.get_term(parkour_name)
-    terrain_names = parkour_event.env_per_terrain_name
     asset: Articulation = env.scene[asset_cfg.name]
     rew = torch.square(asset.data.root_lin_vel_b[:, 2])
-    rew[(terrain_names !='parkour_flat')[:,-1]] *= 0.5
+    rew[~parkour_event.flat_terrain_mask] *= 0.5
     return rew
 
 def reward_orientation(
@@ -150,10 +149,9 @@ def reward_orientation(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ) -> torch.Tensor: 
     parkour_event: ParkourEvent =  env.parkour_manager.get_term(parkour_name)
-    terrain_names = parkour_event.env_per_terrain_name
     asset: Articulation = env.scene[asset_cfg.name]
     rew = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
-    rew[(terrain_names !='parkour_flat')[:,-1]] = 0.
+    rew[~parkour_event.flat_terrain_mask] = 0.
     return rew
 
 def reward_feet_stumble(

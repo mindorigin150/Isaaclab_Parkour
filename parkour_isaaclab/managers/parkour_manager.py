@@ -27,9 +27,10 @@ class ParkourTerm(CommandTerm):
         if env_ids is None:
             env_ids = slice(None)
 
-        extras = {}
-        for metric_name, metric_value in self.metrics.items():
-            extras[metric_name] = torch.mean(metric_value).item()
+        metric_names = tuple(self.metrics)
+        metric_means = torch.stack([torch.mean(metric_value) for metric_value in self.metrics.values()]).tolist()
+        extras = dict(zip(metric_names, metric_means))
+        for metric_value in self.metrics.values():
             metric_value[env_ids] = 0.0
 
         self._resample(env_ids)
@@ -56,19 +57,10 @@ class ParkourTerm(CommandTerm):
         source_code = inspect.getsource(self._set_debug_vis_impl)
         return "NotImplementedError" not in source_code
     
-    def __call__(self):
-        pass 
-
-
-    
 class ParkourManager(CommandManager):
     _env: ParkourManagerBasedRLEnv
     def __init__(self, cfg: object, env: ParkourManagerBasedRLEnv):        
         super().__init__(cfg, env) 
-
-    def __call__(self):
-        for term in self._terms.values():
-            term()
 
     @property
     def has_debug_vis_implementation(self) -> bool:
@@ -103,4 +95,3 @@ class ParkourManager(CommandManager):
                 raise TypeError(f"Returned object for the term '{term_name}' is not of type ParkourType.")
             # add class to dict
             self._terms[term_name] = term
-

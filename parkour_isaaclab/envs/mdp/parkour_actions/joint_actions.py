@@ -36,14 +36,15 @@ class DelayedJointPositionAction(JointPositionAction):
 
     def process_actions(self, actions: torch.Tensor):
         # store the raw actions
-        if self.env.common_step_counter % self._delay_update_global_steps == 0:
-            if len(self._action_delay_steps) != 0:
-                self.delay = torch.tensor(self._action_delay_steps.pop(0), device=self.device, dtype=torch.float)
-        self._action_history_buf = torch.cat([self._action_history_buf[:, 1:].clone(), actions[:, None, :].clone()], dim=1)
-        indices = -1 - self.delay 
         if self._use_delay:
+            if self.env.common_step_counter % self._delay_update_global_steps == 0:
+                if len(self._action_delay_steps) != 0:
+                    self.delay = torch.tensor(self._action_delay_steps.pop(0), device=self.device, dtype=torch.float)
+            self._action_history_buf = torch.cat([self._action_history_buf[:, 1:].clone(), actions[:, None, :].clone()], dim=1)
+            indices = -1 - self.delay
             self._raw_actions[:] = self._action_history_buf[:, indices.long()]
         else:
+            self._action_history_buf[:, -1] = actions
             self._raw_actions[:] = actions
         # apply the affine transformations
 

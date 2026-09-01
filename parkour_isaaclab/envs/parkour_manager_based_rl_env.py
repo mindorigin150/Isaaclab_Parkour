@@ -151,7 +151,6 @@ class ParkourManagerBasedRLEnv(ParkourManagerBasedEnv, gym.Env):
             # trigger recorder terms for post-reset calls
             self.recorder_manager.record_post_reset(reset_env_ids)
         self.command_manager.compute(dt=self.step_dt)
-        self.parkour_manager() ##Just calling parkour mananger for using '_gather_cur_goal' attribute 
 
         # -- update command
         # -- step interval events

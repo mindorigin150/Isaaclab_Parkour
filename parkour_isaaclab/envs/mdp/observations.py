@@ -40,11 +40,14 @@ class ExtremeParkourObservations(ManagerTermBase):
         self.delta_yaw = torch.zeros(self.num_envs, device=self.device)
         self.delta_next_yaw = torch.zeros(self.num_envs, device=self.device)
         self.measured_heights = torch.zeros(self.num_envs, 132, device=self.device)
+        self._priv_latent = None
         self.env = env
         self.body_id = self.asset.find_bodies('base')[0]
         
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self._obs_history_buffer[env_ids, :, :] = 0. 
+        if self._priv_latent is None and env_ids is not None:
+            self._priv_latent = self._get_priv_latent()
 
     def __call__(
         self,
@@ -55,9 +58,8 @@ class ExtremeParkourObservations(ManagerTermBase):
         history_length: int,
         ) -> torch.Tensor:
         
-        terrain_names = self.parkour_event.env_per_terrain_name
-        env_idx_tensor = torch.tensor((terrain_names != 'parkour_flat')).to(dtype = torch.bool, device=self.device)
-        invert_env_idx_tensor = torch.tensor((terrain_names == 'parkour_flat')).to(dtype = torch.bool, device=self.device)
+        invert_env_idx_tensor = self.parkour_event.flat_terrain_mask.unsqueeze(-1)
+        env_idx_tensor = ~invert_env_idx_tensor
         roll, pitch, yaw = euler_xyz_from_quat(self.asset.data.root_quat_w)
         imu_obs = torch.stack((wrap_to_pi(roll), wrap_to_pi(pitch)), dim=1).to(self.device)
         if env.common_step_counter % 5 == 0:
@@ -81,7 +83,7 @@ class ExtremeParkourObservations(ManagerTermBase):
                             self._get_contact_fill(),
                             ),dim=-1)
         priv_explicit = self._get_priv_explicit()
-        priv_latent = self._get_priv_latent()
+        priv_latent = self._priv_latent if self._priv_latent is not None else self._get_priv_latent()
         observations = torch.cat([obs_buf, #53
                                   self.measured_heights, #132
                                   priv_explicit, # 9
@@ -89,14 +91,10 @@ class ExtremeParkourObservations(ManagerTermBase):
                                   self._obs_history_buffer.view(self.num_envs, -1)
                                   ],dim=-1)
         obs_buf[:, 6:8] = 0
-        self._obs_history_buffer = torch.where(
-            (env.episode_length_buf <= 1)[:, None, None], 
-            torch.stack([obs_buf] * self.history_length, dim=1),
-            torch.cat([
-                self._obs_history_buffer[:, 1:],
-                obs_buf.unsqueeze(1)
-            ], dim=1)
-        )
+        self._obs_history_buffer[:, :-1] = self._obs_history_buffer[:, 1:].clone()
+        self._obs_history_buffer[:, -1] = obs_buf
+        reset_ids = env.episode_length_buf <= 1
+        self._obs_history_buffer[reset_ids] = obs_buf[reset_ids].unsqueeze(1)
         return observations 
 
     def _get_contact_fill(
@@ -157,11 +155,10 @@ class image_features(ManagerTermBase):
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         if env_ids is None:
-            env_ids = torch.arange(0, self.num_envs)
+            env_ids = torch.arange(0, self.num_envs, device=self.device)
         depth_images = self.camera_sensor.data.output["distance_to_camera"].squeeze(-1)[env_ids]
-        for depth_image, env_id in zip(depth_images, env_ids):
-            processed_image = self._process_depth_image(depth_image)
-            self.depth_buffer[env_id] = torch.stack([processed_image]* 2, dim=0)
+        processed_images = self._process_depth_image(depth_images)
+        self.depth_buffer[env_ids] = processed_images.unsqueeze(1).expand(-1, self.buffer_len, -1, -1)
 
     def __call__(
         self,
@@ -173,10 +170,9 @@ class image_features(ManagerTermBase):
         ):
         if env.common_step_counter % 5 == 0:
             depth_images = self.camera_sensor.data.output["distance_to_camera"].squeeze(-1)
-            for env_id, depth_image in enumerate(depth_images):
-                processed_image = self._process_depth_image(depth_image)
-                self.depth_buffer[env_id] = torch.cat([self.depth_buffer[env_id, 1:], 
-                                                    processed_image.to(self.device).unsqueeze(0)], dim=0)
+            processed_images = self._process_depth_image(depth_images)
+            self.depth_buffer[:, :-1] = self.depth_buffer[:, 1:].clone()
+            self.depth_buffer[:, -1] = processed_images
         if self.debug_vis:
             depth_images_np = self.depth_buffer[:, -1].detach().cpu().numpy()
             depth_images_norm = []
@@ -195,13 +191,13 @@ class image_features(ManagerTermBase):
 
     def _process_depth_image(self, depth_image):
         depth_image = self._crop_depth_image(depth_image)
-        depth_image = self.resize_transform(depth_image[None, :]).squeeze()
+        depth_image = self.resize_transform(depth_image.unsqueeze(1)).squeeze(1)
         depth_image = self._normalize_depth_image(depth_image)
         return depth_image
 
     def _crop_depth_image(self, depth_image):
         # crop 30 pixels from the left and right and and 20 pixels from bottom and return croped image
-        return depth_image[:-2, 4:-4]
+        return depth_image[..., :-2, 4:-4]
 
     def _normalize_depth_image(self, depth_image):
         depth_image = depth_image  # make similiar to scandot 

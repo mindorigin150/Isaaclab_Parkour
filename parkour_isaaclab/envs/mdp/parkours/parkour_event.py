@@ -4,7 +4,6 @@ from __future__ import annotations
 import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
-import numpy as np 
 from isaaclab.assets import Articulation
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils.math import wrap_to_pi
@@ -37,10 +36,10 @@ class ParkourEvent(ParkourTerm):
                
         self.robot: Articulation = env.scene[cfg.asset_name]
         # -- metrics
-        self.metrics["far_from_current_goal"] = torch.zeros(self.num_envs, device='cpu')
-        self.metrics["how_far_from_start_point"] = torch.zeros(self.num_envs, device='cpu')
-        self.metrics["terrain_levels"] = torch.zeros(self.num_envs, device='cpu')
-        self.metrics["current_goal_idx"] = torch.zeros(self.num_envs, device='cpu')
+        self.metrics["far_from_current_goal"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["how_far_from_start_point"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["terrain_levels"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["current_goal_idx"] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float64)
         self.dis_to_start_pos = torch.zeros(self.num_envs, device=self.device)
         self.terrain: ParkourTerrainImporter = self.env.scene.terrain
         terrain_generator: ParkourTerrainGenerator = self.terrain.terrain_generator_class
@@ -69,10 +68,10 @@ class ParkourEvent(ParkourTerm):
             self.future_goal_idx[:, 0] = False
             self.env_per_heights = self.total_heights[self.terrain.terrain_levels, self.terrain.terrain_types]
        
-        self.total_terrain_names = terrain_generator.terrain_names
-        numpy_terrain_levels = self.terrain.terrain_levels.detach().cpu().numpy() ## string type can't convert to torch
-        numpy_terrain_types = self.terrain.terrain_types.detach().cpu().numpy()
-        self.env_per_terrain_name = self.total_terrain_names[numpy_terrain_levels, numpy_terrain_types]
+        self._terrain_flat_mask = torch.from_numpy(
+            terrain_generator.terrain_names[:, :, -1] == 'parkour_flat'
+        ).to(self.device)
+        self.flat_terrain_mask = self._terrain_flat_mask[self.terrain.terrain_levels, self.terrain.terrain_types]
         self._reset_offset = self.env.event_manager.get_term_cfg('reset_root_state').params['offset']
 
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
@@ -84,11 +83,6 @@ class ParkourEvent(ParkourTerm):
         norm = torch.norm(self.next_target_pos_rel, dim=-1, keepdim=True)
         target_vec_norm = self.next_target_pos_rel / (norm + 1e-5)
         self.next_target_yaw = torch.atan2(target_vec_norm[:, 1], target_vec_norm[:, 0])
-
-
-    def __call__(self):
-        self.cur_goals = self._gather_cur_goals()
-        self.next_goals = self._gather_cur_goals(future=1)
 
     def _gather_cur_goals(self, future=0):
         return self.env_goals.gather(1, (self.cur_goal_idx[:, None, None]+future).expand(-1, -1, self.env_goals.shape[-1])).squeeze(1)
@@ -168,9 +162,9 @@ class ParkourEvent(ParkourTerm):
         target_vec_norm = self.next_target_pos_rel / (norm + 1e-5)
         self.next_target_yaw = torch.atan2(target_vec_norm[:, 1], target_vec_norm[:, 0])
 
-        numpy_terrain_levels = self.terrain.terrain_levels.detach().cpu().numpy()
-        numpy_terrain_types = self.terrain.terrain_types.detach().cpu().numpy()
-        self.env_per_terrain_name = self.total_terrain_names[numpy_terrain_levels, numpy_terrain_types]
+        self.flat_terrain_mask[env_ids] = self._terrain_flat_mask[
+            self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]
+        ]
 
         self.reach_goal_timer[env_ids] = 0
         self.cur_goal_idx[env_ids] = 0
@@ -182,11 +176,11 @@ class ParkourEvent(ParkourTerm):
 
     def _update_metrics(self):
         # logs data
-        self.metrics["terrain_levels"] = (self.terrain.terrain_levels.float()).to(device = 'cpu')
+        self.metrics["terrain_levels"].copy_(self.terrain.terrain_levels.float())
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
-        self.metrics["far_from_current_goal"] = (torch.norm(self.cur_goals[:, :2] - robot_root_pos_w,dim =-1) - self.next_goal_threshold).to(device = 'cpu')
-        self.metrics["current_goal_idx"] = self.cur_goal_idx.to(device='cpu', dtype=float)
-        self.metrics["how_far_from_start_point"] = self.dis_to_start_pos.to(device = 'cpu')
+        self.metrics["far_from_current_goal"].copy_(torch.norm(self.cur_goals[:, :2] - robot_root_pos_w,dim =-1) - self.next_goal_threshold)
+        self.metrics["current_goal_idx"].copy_(self.cur_goal_idx.to(dtype=float))
+        self.metrics["how_far_from_start_point"].copy_(self.dis_to_start_pos)
         
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first tome

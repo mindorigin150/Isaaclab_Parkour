@@ -348,6 +348,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         start_iter = self.current_learning_iteration
         tot_iter = self.current_learning_iteration + num_learning_iterations
         num_pretrain_iter = 0
+        scan_latent = None
         for it in range(start_iter, tot_iter):
             start = time.time()
             actions_buffer = []
@@ -362,7 +363,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                     yaw = 1.5*depth_latent_and_yaw[:, -2:]
                     yaws_buffer.append(obs[:,6:8].detach() - yaw)
                 with torch.no_grad():
-                    actions_teacher = self.alg.policy.act_inference(obs, hist_encoding=True, scandots_latent=None)
+                    if self.env.unwrapped.common_step_counter %5 == 0:
+                        scan_latent = self.alg.policy.actor.infer_scandots_latent(obs)
+                    actions_teacher = self.alg.policy.act_inference(obs, hist_encoding=True, scandots_latent=scan_latent)
                     delta_yaw_ok_buffer.append(torch.nonzero(additional_obs["delta_yaw_ok"]).size(0) / additional_obs["delta_yaw_ok"].numel())
                 obs[additional_obs["delta_yaw_ok"], 6:8] = yaw.detach()[additional_obs["delta_yaw_ok"]]
                 actions_student = self.alg.depth_actor(obs, hist_encoding=True, scandots_latent=depth_latent)
