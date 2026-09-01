@@ -99,7 +99,7 @@ ParkourManagerBasedRLEnv
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.benchmark = True
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")

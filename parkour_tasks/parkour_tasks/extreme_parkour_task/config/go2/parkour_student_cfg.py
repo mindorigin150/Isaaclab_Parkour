@@ -60,7 +60,7 @@ class UnitreeGo2StudentParkourEnvCfg(ParkourManagerBasedRLEnvCfg):
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**18
         # update sensor update periods
         self.scene.depth_camera.update_period = self.sim.dt * self.decimation * 5
-        self.scene.height_scanner.update_period = self.sim.dt * self.decimation * 5
+        self.scene.height_scanner.update_period = self.sim.dt * self.decimation
         self.scene.contact_forces.update_period = self.sim.dt * self.decimation
         self.scene.terrain.terrain_generator.curriculum = True
         self.actions.joint_pos.use_delay = False
