@@ -62,6 +62,8 @@ class DistillationWithExtractor():
         loss = depth_actor_loss + yaw_loss
         self.depth_actor_optimizer.zero_grad()
         loss.backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters()
         nn.utils.clip_grad_norm_(self.depth_actor.parameters(), self.max_grad_norm)
         self.depth_actor_optimizer.step()
         loss_dict = {
@@ -73,22 +75,25 @@ class DistillationWithExtractor():
 
     def broadcast_parameters(self):
         # obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+        model_params = [self.policy.state_dict(), self.depth_actor.state_dict(), self.depth_encoder.state_dict()]
         # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
+        self.depth_actor.load_state_dict(model_params[1])
+        self.depth_encoder.load_state_dict(model_params[2])
 
     def reduce_parameters(self):
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        params = [*self.depth_actor.parameters(), *self.depth_encoder.parameters()]
+        grads = [param.grad.view(-1) for param in params if param.grad is not None]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
-        for param in self.policy.parameters():
+        for param in params:
             if param.grad is not None:
                 numel = param.numel()
                 # copy data back from shared buffer

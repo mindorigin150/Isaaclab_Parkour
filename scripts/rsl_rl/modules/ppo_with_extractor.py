@@ -74,6 +74,25 @@ class PPOWithExtractor(PPO):
         self.priv_reg_coef_schedual = priv_reg_coef_schedual
         self.counter = 0
 
+    def broadcast_parameters(self):
+        super().broadcast_parameters()
+        estimator_params = [self.estimator.state_dict()]
+        torch.distributed.broadcast_object_list(estimator_params, src=0)
+        self.estimator.load_state_dict(estimator_params[0])
+
+    def _reduce_gradients(self, parameters):
+        parameters = tuple(parameters)
+        grads = [param.grad.view(-1) for param in parameters if param.grad is not None]
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+        offset = 0
+        for param in parameters:
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel
+
 
     def act(self, obs, critic_obs, hist_encoding=False):
         if self.policy.is_recurrent:
@@ -192,6 +211,8 @@ class PPOWithExtractor(PPO):
             estimator_loss = (priv_states_predicted - obs_batch[:, self.num_prop+self.num_scan:self.num_prop+self.num_scan+self.priv_states_dim]).pow(2).mean()
             self.estimator_optimizer.zero_grad()
             estimator_loss.backward()
+            if self.is_multi_gpu:
+                self._reduce_gradients(self.estimator.parameters())
             nn.utils.clip_grad_norm_(self.estimator.parameters(), self.max_grad_norm)
             self.estimator_optimizer.step()
 
@@ -394,6 +415,8 @@ class PPOWithExtractor(PPO):
             hist_latent_loss = (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
             self.hist_encoder_optimizer.zero_grad()
             hist_latent_loss.backward()
+            if self.is_multi_gpu:
+                self._reduce_gradients(self.policy.actor.history_encoder.parameters())
             nn.utils.clip_grad_norm_(self.policy.actor.history_encoder.parameters(), self.max_grad_norm)
             self.hist_encoder_optimizer.step()
             mean_hist_latent_loss += hist_latent_loss.item()
