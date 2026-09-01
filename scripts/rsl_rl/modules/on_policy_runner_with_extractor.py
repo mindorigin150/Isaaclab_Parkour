@@ -92,7 +92,6 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                                                     estimator= estimator, 
                                                     estimator_paras= self.estimator_cfg,
                                                     depth_encoder_cfg = self.depth_encoder_cfg,
-                                                    learning_rate = self.alg_cfg['learning_rate'],
                                                     policy_cfg = self.policy_cfg, 
                                                     max_grad_norm = self.alg_cfg['max_grad_norm'],
                                                     device=self.device, 
@@ -329,7 +328,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
 
         obs, extras = self.env.get_observations()
         additional_obs = {}
-        additional_obs["delta_yaw_ok"] = extras['observations']['delta_yaw_ok'].to(self.device)
+        additional_obs["delta_yaw_ok"] = extras['observations']['delta_yaw_ok'].squeeze(-1).to(self.device)
         additional_obs["depth_camera"] = extras["observations"]['depth_camera'].to(self.device)
         obs = obs.to(self.device)
 
@@ -379,7 +378,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                     obs, _, dones, infos = self.env.step(actions_student.detach().to(self.env.device))
                     # Move to device
                     obs, dones = (obs.to(self.device), dones.to(self.device))
-                additional_obs['delta_yaw_ok'] = infos["observations"]['delta_yaw_ok']
+                additional_obs['delta_yaw_ok'] = infos["observations"]['delta_yaw_ok'].squeeze(-1)
                 additional_obs['depth_camera'] = infos["observations"]['depth_camera']
                 # perform normalization
                 obs = self.obs_normalizer(obs)
@@ -434,7 +433,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
 
     def log_vision(self, locs, width=80, pad=35):
         
-        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+        collection_size = self.depth_encoder_cfg["num_steps_per_env"] * self.env.num_envs * self.gpu_world_size
         # Update total time-steps and time
         self.tot_timesteps += collection_size
         self.tot_time += locs["collection_time"] + locs["learn_time"]
@@ -522,10 +521,16 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             'estimator_state_dict': self.alg.estimator.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        if self.depth_encoder_cfg is None:
+            saved_dict["optimizer_state_dict"] = self.alg.optimizer.state_dict()
+            saved_dict["estimator_optimizer_state_dict"] = self.alg.estimator_optimizer.state_dict()
+            saved_dict["hist_encoder_optimizer_state_dict"] = self.alg.hist_encoder_optimizer.state_dict()
+            saved_dict["priv_reg_counter"] = self.alg.counter
+        else:
+            saved_dict["depth_actor_optimizer_state_dict"] = self.alg.depth_actor_optimizer.state_dict()
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -546,37 +551,45 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
 
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
-        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         self.alg.estimator.load_state_dict(loaded_dict['estimator_state_dict'])
+        loading_teacher = False
+        if self.depth_encoder_cfg is not None:
+            depth_keys = ("depth_encoder_state_dict", "depth_actor_state_dict")
+            present_depth_keys = tuple(key in loaded_dict for key in depth_keys)
+            if any(present_depth_keys) and not all(present_depth_keys):
+                raise KeyError("depth encoder and actor states must be saved together")
+            loading_teacher = not all(present_depth_keys)
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
         if self.empirical_normalization:
-            if resumed_training:
+            if loading_teacher:
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+            else:
                 self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
-            else:
-                self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
         if self.depth_encoder_cfg is not None:
-            if 'depth_encoder_state_dict' not in loaded_dict:
+            if loading_teacher:
                 warnings.warn("'depth_encoder_state_dict' key does not exist, not loading depth encoder...")
-            else:
-                print("Saved depth encoder detected, loading...")
-                self.alg.depth_encoder.load_state_dict(loaded_dict['depth_encoder_state_dict'])
-            if 'depth_actor_state_dict' in loaded_dict:
-                print("Saved depth actor detected, loading...")
-                self.alg.depth_actor.load_state_dict(loaded_dict['depth_actor_state_dict'])
-            else:
                 print("No saved depth actor, Copying actor critic actor to depth actor...")
                 self.alg.depth_actor.load_state_dict(self.alg.policy.actor.state_dict())
+            else:
+                print("Saved depth encoder and actor detected, loading...")
+                self.alg.depth_encoder.load_state_dict(loaded_dict["depth_encoder_state_dict"])
+                self.alg.depth_actor.load_state_dict(loaded_dict["depth_actor_state_dict"])
 
-        if load_optimizer and resumed_training:
-            # -- algorithm optimizer
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            # -- RND optimizer if used
+        if load_optimizer:
+            if self.depth_encoder_cfg is None:
+                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+                self.alg.estimator_optimizer.load_state_dict(loaded_dict["estimator_optimizer_state_dict"])
+                self.alg.hist_encoder_optimizer.load_state_dict(loaded_dict["hist_encoder_optimizer_state_dict"])
+                self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
+                self.alg.counter = loaded_dict["priv_reg_counter"]
+            else:
+                self.alg.depth_actor_optimizer.load_state_dict(loaded_dict["depth_actor_optimizer_state_dict"])
+                self.alg.learning_rate = self.alg.depth_actor_optimizer.param_groups[0]["lr"]
             if self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-        # -- load current learning iteration
-        if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 

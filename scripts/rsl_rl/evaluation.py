@@ -123,7 +123,7 @@ def main():
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     ppo_runner = OnPolicyRunnerWithExtractor(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    ppo_runner.load(resume_path, load_optimizer=False)
     print(ppo_runner)
     # obtain the trained policy for inference
 

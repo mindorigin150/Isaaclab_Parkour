@@ -175,7 +175,7 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "DistillationWithExtractor":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        runner.load(resume_path, load_optimizer=agent_cfg.resume)
     # dump the configuration into log-directory
     if not args_cli.distributed or app_launcher.global_rank == 0:
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

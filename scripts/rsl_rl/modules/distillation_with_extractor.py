@@ -15,7 +15,6 @@ class DistillationWithExtractor():
         policy,
         estimator, 
         estimator_paras,
-        learning_rate,
         depth_encoder_cfg,
         policy_cfg,
         device,
@@ -36,8 +35,6 @@ class DistillationWithExtractor():
         self.num_prop = estimator_paras["num_prop"]
         self.num_scan = estimator_paras["num_scan"]
         self.policy = policy
-        self.estimator_optimizer = optim.Adam(self.estimator.parameters(), lr=estimator_paras["learning_rate"])
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         self.rnd = None  # TODO: remove when runner has a proper base class
 

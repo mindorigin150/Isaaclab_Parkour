@@ -90,7 +90,7 @@ class ParkourDemoGO2:
         self.device = self.env.unwrapped.device
         # load previously trained model
         ppo_runner = OnPolicyRunnerWithExtractor(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
-        ppo_runner.load(checkpoint)
+        ppo_runner.load(checkpoint, load_optimizer=False)
         # obtain the trained policy for inference
         self.estimator = ppo_runner.get_estimator_inference_policy(device=self.device)
         if agent_cfg.algorithm.class_name == 'PPOWithExtractor':
