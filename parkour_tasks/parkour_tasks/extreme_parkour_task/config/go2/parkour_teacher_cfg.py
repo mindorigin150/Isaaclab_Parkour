@@ -52,6 +52,7 @@ class UnitreeGo2TeacherParkourEnvCfg(ParkourManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**18
+        self.sim.physx.gpu_max_num_partitions = 4
         # update sensor update periods
         self.scene.height_scanner.update_period = self.sim.dt * self.decimation
         self.scene.contact_forces.update_period = self.sim.dt * self.decimation
