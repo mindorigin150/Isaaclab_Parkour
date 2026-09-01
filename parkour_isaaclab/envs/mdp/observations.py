@@ -178,7 +178,7 @@ class image_features(ManagerTermBase):
                 self.depth_buffer[env_id] = torch.cat([self.depth_buffer[env_id, 1:], 
                                                     processed_image.to(self.device).unsqueeze(0)], dim=0)
         if self.debug_vis:
-            depth_images_np = self.depth_buffer[:, -2].detach().cpu().numpy()
+            depth_images_np = self.depth_buffer[:, -1].detach().cpu().numpy()
             depth_images_norm = []
             for img in depth_images_np:
                 depth_images_norm.append(img)
@@ -191,7 +191,7 @@ class image_features(ManagerTermBase):
             grid_img = np.vstack(rows)   
             cv2.imshow("depth_images_grid", grid_img)
             cv2.waitKey(1)
-        return self.depth_buffer[:, -2].to(env.device)
+        return self.depth_buffer[:, -1].to(env.device)
 
     def _process_depth_image(self, depth_image):
         depth_image = self._crop_depth_image(depth_image)
@@ -226,4 +226,4 @@ class obervation_delta_yaw_ok(ManagerTermBase):
             asset: Articulation = env.scene[asset_cfg.name]
             _, _, yaw = euler_xyz_from_quat(asset.data.root_quat_w)
             self.delta_yaw = parkour_event.target_yaw - wrap_to_pi(yaw)
-        return self.delta_yaw < threshold
+        return (self.delta_yaw < threshold).unsqueeze(-1)

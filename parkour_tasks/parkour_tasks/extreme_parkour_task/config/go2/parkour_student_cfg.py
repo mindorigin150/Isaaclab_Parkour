@@ -30,7 +30,7 @@ class ParkourStudentSceneCfg(ParkourTeacherSceneCfg):
 
             else:
                 sub_terrain.proportion = 0.2
-                if key is not 'parkour':
+                if key != 'parkour':
                     sub_terrain.y_range = (-0.1, 0.1)
 
 
@@ -63,7 +63,7 @@ class UnitreeGo2StudentParkourEnvCfg(ParkourManagerBasedRLEnvCfg):
         self.scene.height_scanner.update_period = self.sim.dt * self.decimation
         self.scene.contact_forces.update_period = self.sim.dt * self.decimation
         self.scene.terrain.terrain_generator.curriculum = True
-        self.actions.joint_pos.use_delay = True
+        self.actions.joint_pos.use_delay = False
         self.actions.joint_pos.history_length = 8
 
 
@@ -81,8 +81,6 @@ class UnitreeGo2StudentParkourEnvCfg_EVAL(UnitreeGo2StudentParkourEnvCfg):
 
         self.scene.depth_camera_usd = CAMERA_USD_CFG
         self.scene.terrain.max_init_terrain_level = None
-
-        self.observations.depth_camera.depth_cam.params['debug_vis'] = True
 
         self.commands.base_velocity.resampling_time_range = (60.,60.)
         self.commands.base_velocity.debug_vis = True
@@ -123,4 +121,3 @@ class UnitreeGo2StudentParkourEnvCfg_PLAY(UnitreeGo2StudentParkourEnvCfg_EVAL):
             else:
                 sub_terrain.proportion = 0.25
                 sub_terrain.noise_range = (0.02, 0.02)
-

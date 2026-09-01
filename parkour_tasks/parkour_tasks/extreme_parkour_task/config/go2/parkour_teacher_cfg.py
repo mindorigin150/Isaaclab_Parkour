@@ -82,7 +82,7 @@ class UnitreeGo2TeacherParkourEnvCfg_EVAL(UnitreeGo2TeacherParkourEnvCfg):
         self.events.push_by_setting_velocity.interval_range_s = (6.,6.)
         self.commands.base_velocity.resampling_time_range = (60.,60.)
         for key, sub_terrain in self.scene.terrain.terrain_generator.sub_terrains.items():
-            if key ==['parkour','parkour_hurdle','parkour_step','parkour_gap']:
+            if key in ['parkour','parkour_hurdle','parkour_step','parkour_gap']:
                 sub_terrain.noise_range = (0.02, 0.02)
                 sub_terrain.proportion = 0.25
                 
