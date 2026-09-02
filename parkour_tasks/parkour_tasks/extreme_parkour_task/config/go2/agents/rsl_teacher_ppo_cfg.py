@@ -42,11 +42,10 @@ class UnitreeGo2ParkourTeacherPPORunnerCfg(ParkourRslRlOnPolicyRunnerCfg):
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate = 2.e-4,
-        schedule="adaptive",
+        schedule="fixed",
         gamma=0.99,
         lam=0.95,
         max_grad_norm=1.0,
         dagger_update_freq = 20,
         priv_reg_coef_schedual = [0.0, 0.1, 2000.0, 3000.0],
     )
-
