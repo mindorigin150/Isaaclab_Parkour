@@ -1,9 +1,15 @@
 """RGB-enabled evaluation configuration for the Parkour VLA benchmark."""
 
 import torch
+from parkour_isaaclab.actor import (
+    GO2_PARKOUR_PERCEPTION_DIM,
+    GO2_PARKOUR_PROPRIO_DIM,
+    GO2_PARKOUR_TERRAIN_LATENT_DIM,
+    GO2_PARKOUR_YAW_DIM,
+)
 
 import isaaclab.sim as sim_utils
-from isaaclab.managers import TerminationTermCfg
+from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
 from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
 
@@ -13,12 +19,20 @@ from .parkour_teacher_cfg import (
     ParkourTeacherSceneCfg,
     UnitreeGo2TeacherParkourEnvCfg_EVAL,
 )
+from .parkour_student_cfg import (
+    ParkourStudentSceneCfg,
+    UnitreeGo2StudentParkourEnvCfg,
+    UnitreeGo2StudentParkourEnvCfg_EVAL,
+)
 
 
 PARKOUR_VLA_PROMPT = "Traverse the parkour course and follow each waypoint."
 PARKOUR_VLA_CAMERA_PERIOD_S = 0.1
-PARKOUR_VLA_LATENT_DIM = 32
-PARKOUR_VLA_PROPRIO_DIM = 53
+PARKOUR_VLA_LATENT_DIM = GO2_PARKOUR_TERRAIN_LATENT_DIM
+PARKOUR_VLA_YAW_DIM = GO2_PARKOUR_YAW_DIM
+PARKOUR_VLA_ACTION_DIM = GO2_PARKOUR_PERCEPTION_DIM
+PARKOUR_VLA_CONTROL_REPEAT = 5
+PARKOUR_VLA_PROPRIO_DIM = GO2_PARKOUR_PROPRIO_DIM
 
 
 def parkour_success(env) -> torch.Tensor:
@@ -53,6 +67,32 @@ class ParkourVlaSceneCfg(ParkourTeacherSceneCfg):
 
 
 @configclass
+class ParkourVlaStudentSceneCfg(ParkourStudentSceneCfg):
+    """Student training scene with the same RGB camera as the VLA eval scene."""
+
+    vla_camera = ParkourVlaSceneCfg.vla_camera
+
+
+def _configure_dagger_env(cfg) -> None:
+    cfg.scene.depth_camera = None
+    cfg.scene.depth_camera_usd = None
+    cfg.observations.depth_camera = None
+    cfg.observations.delta_yaw_ok = None
+    cfg.events.random_camera_position.params["sensor_cfg"] = SceneEntityCfg(
+        "vla_camera"
+    )
+    cfg.rerender_on_reset = True
+    cfg.terminations.parkour_success = TerminationTermCfg(
+        func=parkour_success,
+        time_out=False,
+    )
+    cfg.scene.vla_camera.update_period = PARKOUR_VLA_CAMERA_PERIOD_S
+    cfg.scene.height_scanner.update_period = cfg.sim.dt * cfg.decimation
+    cfg.parkours.base_parkour.debug_vis = False
+    cfg.commands.base_velocity.debug_vis = False
+
+
+@configclass
 class UnitreeGo2ParkourVlaEnvCfg(UnitreeGo2TeacherParkourEnvCfg_EVAL):
     """Zero-delay Parkour evaluation scene used by collectors and VLA policies."""
 
@@ -69,3 +109,29 @@ class UnitreeGo2ParkourVlaEnvCfg(UnitreeGo2TeacherParkourEnvCfg_EVAL):
         self.scene.height_scanner.update_period = self.sim.dt * self.decimation
         self.parkours.base_parkour.debug_vis = False
         self.commands.base_velocity.debug_vis = False
+
+
+@configclass
+class UnitreeGo2ParkourVlaDaggerEnvCfg(UnitreeGo2StudentParkourEnvCfg):
+    """Student-driven, zero-delay scene used for VLA DAgger collection."""
+
+    scene: ParkourVlaStudentSceneCfg = ParkourVlaStudentSceneCfg(
+        num_envs=192, env_spacing=1.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_dagger_env(self)
+
+
+@configclass
+class UnitreeGo2ParkourVlaDaggerEvalEnvCfg(UnitreeGo2StudentParkourEnvCfg_EVAL):
+    """Fixed evaluation scene for the jointly trained VLA and actor."""
+
+    scene: ParkourVlaStudentSceneCfg = ParkourVlaStudentSceneCfg(
+        num_envs=50, env_spacing=1.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_dagger_env(self)
