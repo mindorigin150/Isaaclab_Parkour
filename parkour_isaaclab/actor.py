@@ -1,4 +1,4 @@
-"""Pure PyTorch Go2 Parkour actor shared by Isaac Lab and VLA training."""
+"""Pure PyTorch Go2 Parkour actor implementation."""
 
 from __future__ import annotations
 
@@ -6,13 +6,7 @@ import torch
 import torch.nn as nn
 
 
-GO2_PARKOUR_ACTION_DIM = 12
-GO2_PARKOUR_ACTOR_OBSERVATION_DIM = 753
-GO2_PARKOUR_HISTORY_LENGTH = 10
-GO2_PARKOUR_PRIV_EXPLICIT_DIM = 9
-GO2_PARKOUR_PRIV_LATENT_DIM = 29
 GO2_PARKOUR_PROPRIO_DIM = 53
-GO2_PARKOUR_SCAN_DIM = 132
 GO2_PARKOUR_TERRAIN_LATENT_DIM = 32
 GO2_PARKOUR_YAW_DIM = 2
 GO2_PARKOUR_PERCEPTION_DIM = GO2_PARKOUR_TERRAIN_LATENT_DIM + GO2_PARKOUR_YAW_DIM
@@ -250,58 +244,11 @@ class Actor(nn.Module):
         return self.scan_encoder(scan)
 
 
-def build_go2_parkour_actor() -> Actor:
-    return Actor(
-        GO2_PARKOUR_ACTION_DIM,
-        scan_encoder_dims=[128, 64, GO2_PARKOUR_TERRAIN_LATENT_DIM],
-        actor_hidden_dims=[512, 256, 128],
-        priv_encoder_dims=[64, 20],
-        activation=nn.ELU(),
-        num_prop=GO2_PARKOUR_PROPRIO_DIM,
-        num_scan=GO2_PARKOUR_SCAN_DIM,
-        num_hist=GO2_PARKOUR_HISTORY_LENGTH,
-        num_priv_latent=GO2_PARKOUR_PRIV_LATENT_DIM,
-        num_priv_explicit=GO2_PARKOUR_PRIV_EXPLICIT_DIM,
-        state_history_encoder={"class_name": "StateHistoryEncoder", "channel_size": 10},
-    )
-
-
-def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
-    return torch.atan2(torch.sin(angle), torch.cos(angle))
-
-
-def apply_parkour_mts(
-    actor_observation: torch.Tensor,
-    predicted_yaw: torch.Tensor,
-    yaw_scale: float = 1.5,
-    mts_threshold: float = 0.6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    observation = actor_observation.clone()
-    current_yaw_error = _wrap_to_pi(
-        yaw_scale * predicted_yaw[..., 0] - observation[..., 6]
-    )
-    use_prediction = current_yaw_error.abs() < mts_threshold
-    observation[..., 6:8] = torch.where(
-        use_prediction[..., None],
-        yaw_scale * predicted_yaw,
-        observation[..., 6:8],
-    )
-    return observation, use_prediction
-
-
 __all__ = [
     "Actor",
     "StateHistoryEncoder",
-    "GO2_PARKOUR_ACTION_DIM",
-    "GO2_PARKOUR_ACTOR_OBSERVATION_DIM",
-    "GO2_PARKOUR_HISTORY_LENGTH",
     "GO2_PARKOUR_PERCEPTION_DIM",
-    "GO2_PARKOUR_PRIV_EXPLICIT_DIM",
-    "GO2_PARKOUR_PRIV_LATENT_DIM",
     "GO2_PARKOUR_PROPRIO_DIM",
-    "GO2_PARKOUR_SCAN_DIM",
     "GO2_PARKOUR_TERRAIN_LATENT_DIM",
     "GO2_PARKOUR_YAW_DIM",
-    "apply_parkour_mts",
-    "build_go2_parkour_actor",
 ]
