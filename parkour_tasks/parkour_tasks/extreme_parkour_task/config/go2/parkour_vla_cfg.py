@@ -33,6 +33,28 @@ PARKOUR_VLA_YAW_DIM = GO2_PARKOUR_YAW_DIM
 PARKOUR_VLA_ACTION_DIM = GO2_PARKOUR_PERCEPTION_DIM
 PARKOUR_VLA_CONTROL_REPEAT = 5
 PARKOUR_VLA_PROPRIO_DIM = GO2_PARKOUR_PROPRIO_DIM
+PARKOUR_VLA_CAMERA_CFG = TiledCameraCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/base/vla_camera",
+    update_period=PARKOUR_VLA_CAMERA_PERIOD_S,
+    height=150,
+    width=256,
+    data_types=["rgb", "instance_segmentation_fast"],
+    colorize_instance_segmentation=False,
+    spawn=sim_utils.PinholeCameraCfg(
+        focal_length=11.041,
+        focus_distance=400.0,
+        horizontal_aperture=20.955,
+        vertical_aperture=12.240,
+        clipping_range=(0.1, 100.0),
+    ),
+    offset=TiledCameraCfg.OffsetCfg(
+        pos=(0.33, 0.0, 0.08),
+        rot=quat_from_euler_xyz_tuple(
+            *tuple(torch.deg2rad(torch.tensor([180, 70, -90])))
+        ),
+        convention="ros",
+    ),
+)
 
 
 def parkour_success(env) -> torch.Tensor:
@@ -44,36 +66,18 @@ def parkour_success(env) -> torch.Tensor:
 class ParkourVlaSceneCfg(ParkourTeacherSceneCfg):
     """Teacher scene with a batched robot-mounted RGB camera."""
 
-    vla_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base/vla_camera",
-        update_period=PARKOUR_VLA_CAMERA_PERIOD_S,
-        height=256,
-        width=256,
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=11.041,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 100.0),
-        ),
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.33, 0.0, 0.08),
-            rot=quat_from_euler_xyz_tuple(
-                *tuple(torch.deg2rad(torch.tensor([180, 70, -90])))
-            ),
-            convention="ros",
-        ),
-    )
+    vla_camera = PARKOUR_VLA_CAMERA_CFG
 
 
 @configclass
 class ParkourVlaStudentSceneCfg(ParkourStudentSceneCfg):
     """Student training scene with the same RGB camera as the VLA eval scene."""
 
-    vla_camera = ParkourVlaSceneCfg.vla_camera
+    vla_camera = PARKOUR_VLA_CAMERA_CFG
 
 
 def _configure_dagger_env(cfg) -> None:
+    cfg.scene.robot.spawn.semantic_tags = [("class", "robot")]
     cfg.scene.depth_camera = None
     cfg.scene.depth_camera_usd = None
     cfg.observations.depth_camera = None
@@ -100,6 +104,7 @@ class UnitreeGo2ParkourVlaEnvCfg(UnitreeGo2TeacherParkourEnvCfg_EVAL):
 
     def __post_init__(self):
         super().__post_init__()
+        self.scene.robot.spawn.semantic_tags = [("class", "robot")]
         self.rerender_on_reset = True
         self.terminations.parkour_success = TerminationTermCfg(
             func=parkour_success,

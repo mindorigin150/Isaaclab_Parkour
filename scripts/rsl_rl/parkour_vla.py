@@ -78,7 +78,9 @@ if __name__ == "__main__":
 
     import gymnasium as gym
     import numpy as np
+    import omni.usd
     import torch
+    import usdrt
     from PIL import Image
 
     from parkour_isaaclab.actor import apply_parkour_mts
@@ -135,13 +137,38 @@ def _load_environment_and_teacher():
 
 
 def _rgb_frames(env) -> np.ndarray:
-    return (
-        env.unwrapped.scene["vla_camera"]
-        .data.output["rgb"][..., :3]
-        .detach()
-        .cpu()
-        .numpy()
-    )
+    camera = env.unwrapped.scene["vla_camera"]
+    visible = camera.data.output["rgb"][..., :3].clone()
+    instance_ids = camera.data.output["instance_segmentation_fast"][..., 0].clone()
+    id_to_labels = camera.data.info["instance_segmentation_fast"]["idToLabels"].copy()
+
+    stage = usdrt.Usd.Stage.Attach(omni.usd.get_context().get_stage_id())
+    # Parkour's only Fabric mesh prototypes are the 17 shared Go2 visuals.
+    visibility_attributes = [
+        stage.GetPrimAtPath(path).CreateAttribute(
+            "_worldVisibility", usdrt.Sdf.ValueTypeNames.Bool, False
+        )
+        for path in stage.GetPrimsWithTypeName("Mesh")
+        if str(path).startswith("/__Prototype_")
+    ]
+    for attribute in visibility_attributes:
+        attribute.Set(False)
+    try:
+        env.unwrapped.sim.render()
+        camera._is_outdated[:] = True
+        camera.update(0.0, force_recompute=True)
+        background = camera.data.output["rgb"][..., :3].clone()
+    finally:
+        for attribute in visibility_attributes:
+            attribute.Set(True)
+
+    own_robot_pixels = torch.zeros_like(instance_ids, dtype=torch.bool)
+    for instance_id, robot_path in id_to_labels.items():
+        if robot_path.startswith("/World/envs/"):
+            env_id = int(robot_path.split("/")[3].removeprefix("env_"))
+            own_robot_pixels[env_id] |= instance_ids[env_id] == instance_id
+    background[own_robot_pixels] = visible[own_robot_pixels]
+    return background.detach().cpu().numpy()
 
 
 def _policy_observations(rgb: np.ndarray, state: np.ndarray, slots: list[int], step: int):
