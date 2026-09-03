@@ -617,7 +617,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
             else:
                 row_data = {}
 
-            for _ in range(PARKOUR_VLA_CONTROL_REPEAT):
+            for repeat_index in range(PARKOUR_VLA_CONTROL_REPEAT):
                 with torch.inference_mode():
                     actions = teacher_policy(
                         _actor_observation_with_yaw(obs, predicted_yaw),
@@ -636,6 +636,23 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
 
                 phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
                 control_step += 1
+                reset_ids = dones.nonzero(as_tuple=False).flatten()
+                phase[reset_ids] = 0
+                if reset_ids.numel() and repeat_index + 1 < PARKOUR_VLA_CONTROL_REPEAT:
+                    slots = reset_ids.cpu().tolist()
+                    predicted = _predict_vla_outputs(
+                        pool,
+                        _rgb_frames(env),
+                        obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy(),
+                        slots,
+                        control_step,
+                    )
+                    latent[reset_ids] = torch.from_numpy(
+                        predicted[:, :PARKOUR_VLA_LATENT_DIM]
+                    ).to(env.device)
+                    predicted_yaw[reset_ids] = torch.from_numpy(
+                        predicted[:, PARKOUR_VLA_LATENT_DIM :]
+                    ).to(env.device)
             for slot in selected:
                 row = row_data[slot]
                 row["termination"] = np.asarray(row["termination"], dtype=bool)
