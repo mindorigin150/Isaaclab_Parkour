@@ -189,7 +189,7 @@ def reward_tracking_yaw(
     q = asset.data.root_quat_w
     yaw = torch.atan2(2*(q[:,0]*q[:,3] + q[:,1]*q[:,2]),
                     1 - 2*(q[:,2]**2 + q[:,3]**2))
-    return torch.exp(-torch.abs((parkour_event.target_yaw - yaw)))
+    return torch.exp(-torch.abs(wrap_to_pi(parkour_event.target_yaw - yaw)))
 
 class reward_delta_torques(ManagerTermBase):
     def __init__(self, cfg: RewardTermCfg, env: ParkourManagerBasedRLEnv):

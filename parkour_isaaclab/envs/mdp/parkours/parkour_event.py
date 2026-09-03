@@ -133,16 +133,17 @@ class ParkourEvent(ParkourTerm):
                                   self._reset_offset, 0)).to(self.device)
 
         self.dis_to_start_pos = torch.norm(start_pos - self.robot.data.root_pos_w[env_ids, :2], dim=1)
-        threshold = self.env.command_manager.get_command("base_velocity")[env_ids, 0] * self.episode_length_s
-        move_up = self.dis_to_start_pos > 0.8*threshold
-        move_down = self.dis_to_start_pos < 0.4*threshold
 
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
-        self.terrain.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
-        # # Robots that solve the last level are sent to a random one
-        self.terrain.terrain_levels[env_ids] = torch.where(self.terrain.terrain_levels[env_ids]>=self.terrain.max_terrain_level,
-                                                   torch.randint_like(self.terrain.terrain_levels[env_ids], self.terrain.max_terrain_level),
-                                                   torch.clip(self.terrain.terrain_levels[env_ids], 0)) # (the minumum level is zero)
+        if self.terrain.cfg.terrain_generator.curriculum:
+            threshold = self.env.command_manager.get_command("base_velocity")[env_ids, 0] * self.episode_length_s
+            move_up = self.dis_to_start_pos > 0.8*threshold
+            move_down = self.dis_to_start_pos < 0.4*threshold
+            self.terrain.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
+            # # Robots that solve the last level are sent to a random one
+            self.terrain.terrain_levels[env_ids] = torch.where(self.terrain.terrain_levels[env_ids]>=self.terrain.max_terrain_level,
+                                                       torch.randint_like(self.terrain.terrain_levels[env_ids], self.terrain.max_terrain_level),
+                                                       torch.clip(self.terrain.terrain_levels[env_ids], 0)) # (the minumum level is zero)
         self.env_origins[env_ids] = self.terrain.terrain_origins[self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]]
         self.env_class[env_ids] = self.terrain_class[self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]]
         

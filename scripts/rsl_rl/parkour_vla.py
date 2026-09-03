@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 PARKOUR_TASK = "Isaac-Extreme-Parkour-VLA-Unitree-Go2-v0"
+PARKOUR_EVAL_MODES = {"teacher-eval", "oracle-eval", "vla-eval"}
 REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -38,7 +39,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--task", default=PARKOUR_TASK)
     parser.add_argument("--num_envs", type=int)
-    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--eval_episodes", type=int, default=100)
+    parser.add_argument("--max_episode_steps", type=int, default=1500)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--disable_fabric", action="store_true")
     parser.add_argument("--use_pretrained_checkpoint", action="store_true")
@@ -79,6 +81,11 @@ if __name__ == "__main__":
     from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 
     import isaaclab_tasks  # noqa: F401
+    from parkour_isaaclab.actor import (
+        GO2_PARKOUR_MTS_THRESHOLD_RAD,
+        GO2_PARKOUR_YAW_SCALE,
+        apply_parkour_mts,
+    )
     from parkour_tasks.extreme_parkour_task.config.go2.parkour_vla_cfg import (
         PARKOUR_VLA_LATENT_DIM,
         PARKOUR_VLA_ACTION_DIM,
@@ -101,6 +108,10 @@ def _load_environment_and_teacher():
         use_fabric=not args_cli.disable_fabric,
     )
     env_cfg.seed = args_cli.seed
+    if args_cli.mode in PARKOUR_EVAL_MODES:
+        env_cfg.episode_length_s = (
+            args_cli.max_episode_steps * env_cfg.sim.dt * env_cfg.decimation
+        )
     agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     log_root = Path("logs") / "rsl_rl" / agent_cfg.experiment_name
     if args_cli.use_pretrained_checkpoint:
@@ -113,6 +124,8 @@ def _load_environment_and_teacher():
         )
 
     env = gym.make(args_cli.task, cfg=env_cfg)
+    if args_cli.mode in PARKOUR_EVAL_MODES:
+        env.unwrapped.scene.terrain.cfg.terrain_generator.curriculum = False
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
     env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -220,7 +233,7 @@ def _summary(values: list[float]) -> dict[str, float]:
 
 def _actor_observation_with_yaw(obs, normalized_yaw):
     actor_obs = obs.clone()
-    actor_obs[:, 6:8] = normalized_yaw * 1.5
+    actor_obs[:, 6:8] = normalized_yaw * GO2_PARKOUR_YAW_SCALE
     return actor_obs
 
 
@@ -228,7 +241,6 @@ def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) ->
     pool = _new_policy_pool() if use_vla else None
     obs, _ = env.get_observations()
     num_envs = env.num_envs
-    active = torch.ones(num_envs, dtype=torch.bool, device=env.device)
     phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
     latent = torch.zeros(
         (num_envs, PARKOUR_VLA_LATENT_DIM), dtype=obs.dtype, device=env.device
@@ -242,13 +254,14 @@ def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) ->
     episode_lengths: list[float] = []
     progress: list[float] = []
     edge_violations: list[float] = []
+    episode_edges: list[list[float]] = [[] for _ in range(num_envs)]
     edge_term = env.unwrapped.reward_manager.get_term_cfg("reward_feet_edge").func
     parkour = env.unwrapped.parkour_manager.get_term("base_parkour")
 
     try:
-        for step in range(args_cli.max_steps):
-            due = active & (phase == 0)
-            due_ids = due.nonzero(as_tuple=False).flatten()
+        step = 0
+        while len(episode_returns) < args_cli.eval_episodes:
+            due_ids = (phase == 0).nonzero(as_tuple=False).flatten()
             with torch.inference_mode():
                 if use_oracle and due_ids.numel():
                     latent[due_ids] = actor.infer_scandots_latent(obs[due_ids])
@@ -279,35 +292,43 @@ def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) ->
                     else teacher_policy(actor_obs, hist_encoding=True)
                 )
 
-            current_active = active.clone()
             goal_index = parkour.cur_goal_idx.clone()
             obs, rewards, dones, _ = env.step(actions)
             successes = env.unwrapped.termination_manager.get_term(
                 "parkour_success"
             )
             edge = edge_term.feet_at_edge.sum(dim=1).float()
-            edge_violations.extend(edge[current_active].cpu().numpy().tolist())
-            returns[current_active] += rewards[current_active]
-            lengths[current_active] += 1
-            phase[current_active] = (phase[current_active] + 1) % 5
+            for slot, value in enumerate(edge.cpu().numpy().tolist()):
+                episode_edges[slot].append(value)
+            returns += rewards
+            lengths += 1
+            phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
 
-            done_ids = (current_active & dones.bool()).nonzero(as_tuple=False).flatten()
+            done_ids = dones.bool().nonzero(as_tuple=False).flatten()
             if done_ids.numel():
-                episode_returns.extend(returns[done_ids].cpu().numpy().tolist())
-                episode_lengths.extend(lengths[done_ids].cpu().numpy().tolist())
+                remaining = args_cli.eval_episodes - len(episode_returns)
+                accepted_ids = done_ids[:remaining]
+                episode_returns.extend(returns[accepted_ids].cpu().numpy().tolist())
+                episode_lengths.extend(lengths[accepted_ids].cpu().numpy().tolist())
                 episode_progress = (
-                    goal_index[done_ids] + successes[done_ids].long()
+                    goal_index[accepted_ids] + successes[accepted_ids].long()
                 ).float() / parkour.num_goals
                 progress.extend(episode_progress.cpu().numpy().tolist())
-                active[done_ids] = False
-            if not active.any():
-                break
+                for slot in accepted_ids.cpu().tolist():
+                    edge_violations.extend(episode_edges[slot])
+                returns[done_ids] = 0
+                lengths[done_ids] = 0
+                phase[done_ids] = 0
+                for slot in done_ids.cpu().tolist():
+                    episode_edges[slot].clear()
+            step += 1
     finally:
         if pool is not None:
             pool.close()
 
     return {
         "episodes": len(episode_returns),
+        "max_episode_steps": args_cli.max_episode_steps,
         "reward": _summary(episode_returns),
         "episode_length": _summary(episode_lengths),
         "normalized_waypoint_progress": _summary(progress),
@@ -551,7 +572,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
     pool = _new_policy_pool()
     obs, _ = env.get_observations()
     num_envs = env.num_envs
-    phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
+    all_ids = torch.arange(num_envs, device=env.device)
     latent = torch.zeros(
         (num_envs, PARKOUR_VLA_LATENT_DIM), dtype=obs.dtype, device=env.device
     )
@@ -561,37 +582,31 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
     oracle_latent = torch.zeros_like(latent)
     rows: list[dict] = []
     control_step = 0
+    mts_prediction_count = 0
+    mts_total_count = 0
 
     try:
         while row_count + len(rows) < target_rows and simulation_app.is_running():
-            due_ids = (phase == 0).nonzero(as_tuple=False).flatten()
             rgb = _rgb_frames(env)
             with torch.inference_mode():
-                if due_ids.numel():
-                    slots = due_ids.cpu().tolist()
-                    predicted = _predict_vla_outputs(
-                        pool,
-                        rgb,
-                        obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy(),
-                        slots,
-                        control_step,
-                    )
-                    latent[due_ids] = torch.from_numpy(
-                        predicted[:, :PARKOUR_VLA_LATENT_DIM]
-                    ).to(env.device)
-                    predicted_yaw[due_ids] = torch.from_numpy(
-                        predicted[:, PARKOUR_VLA_LATENT_DIM :]
-                    ).to(env.device)
-                    remaining = target_rows - row_count - len(rows)
-                    selected_ids = due_ids[:remaining]
-                    selected = selected_ids.cpu().tolist()
-                else:
-                    selected_ids = due_ids
-                    selected = []
-
-            if due_ids.numel():
-                with torch.inference_mode():
-                    oracle_latent[due_ids] = actor.infer_scandots_latent(obs[due_ids])
+                slots = all_ids.cpu().tolist()
+                predicted = _predict_vla_outputs(
+                    pool,
+                    rgb,
+                    obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy(),
+                    slots,
+                    control_step,
+                )
+                latent[:] = torch.from_numpy(
+                    predicted[:, :PARKOUR_VLA_LATENT_DIM]
+                ).to(env.device)
+                predicted_yaw[:] = torch.from_numpy(
+                    predicted[:, PARKOUR_VLA_LATENT_DIM :]
+                ).to(env.device)
+                oracle_latent[:] = actor.infer_scandots_latent(obs)
+            remaining = target_rows - row_count - len(rows)
+            selected_ids = all_ids[:remaining]
+            selected = selected_ids.cpu().tolist()
 
             if selected:
                 selected_states = _masked_vla_state(
@@ -601,7 +616,11 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
                     .numpy()
                 )
                 selected_actions = torch.cat(
-                    (oracle_latent[selected_ids], obs[selected_ids, 6:8] / 1.5), dim=1
+                    (
+                        oracle_latent[selected_ids],
+                        obs[selected_ids, 6:8] / GO2_PARKOUR_YAW_SCALE,
+                    ),
+                    dim=1,
                 ).detach().cpu().numpy()
                 row_data = {
                     slot: {
@@ -619,8 +638,14 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
 
             for repeat_index in range(PARKOUR_VLA_CONTROL_REPEAT):
                 with torch.inference_mode():
+                    actor_observation, use_prediction = apply_parkour_mts(
+                        obs,
+                        predicted_yaw,
+                    )
+                    mts_prediction_count += use_prediction.sum().item()
+                    mts_total_count += use_prediction.numel()
                     actions = teacher_policy(
-                        _actor_observation_with_yaw(obs, predicted_yaw),
+                        actor_observation,
                         hist_encoding=True,
                         scandots_latent=latent,
                     )
@@ -634,10 +659,8 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
                     ):
                         row_data[slot]["termination"].append(termination)
 
-                phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
                 control_step += 1
                 reset_ids = dones.nonzero(as_tuple=False).flatten()
-                phase[reset_ids] = 0
                 if reset_ids.numel() and repeat_index + 1 < PARKOUR_VLA_CONTROL_REPEAT:
                     slots = reset_ids.cpu().tolist()
                     predicted = _predict_vla_outputs(
@@ -706,12 +729,14 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
         "vla_action_dim": PARKOUR_VLA_ACTION_DIM,
         "vla_latent_dim": PARKOUR_VLA_LATENT_DIM,
         "vla_yaw_dim": PARKOUR_VLA_YAW_DIM,
-        "vla_yaw_scale": 1.5,
+        "vla_yaw_scale": GO2_PARKOUR_YAW_SCALE,
         "vla_proprio_dim": PARKOUR_VLA_PROPRIO_DIM,
         "base_prompt": PARKOUR_VLA_PROMPT,
         "teacher_checkpoint": str(checkpoint),
         "failure_and_timeout_rows_retained": True,
         "state_yaw_indices_masked": [6, 7],
+        "dagger_mts_threshold_rad": GO2_PARKOUR_MTS_THRESHOLD_RAD,
+        "dagger_mts_prediction_fraction": mts_prediction_count / mts_total_count,
     }
     temporary = output_dir / "metadata.json.tmp"
     with temporary.open("w", encoding="utf-8") as handle:

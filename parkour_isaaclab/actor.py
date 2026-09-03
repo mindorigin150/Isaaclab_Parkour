@@ -10,6 +10,8 @@ GO2_PARKOUR_PROPRIO_DIM = 53
 GO2_PARKOUR_TERRAIN_LATENT_DIM = 32
 GO2_PARKOUR_YAW_DIM = 2
 GO2_PARKOUR_PERCEPTION_DIM = GO2_PARKOUR_TERRAIN_LATENT_DIM + GO2_PARKOUR_YAW_DIM
+GO2_PARKOUR_YAW_SCALE = 1.5
+GO2_PARKOUR_MTS_THRESHOLD_RAD = 0.6
 
 
 class StateHistoryEncoder(nn.Module):
@@ -244,11 +246,34 @@ class Actor(nn.Module):
         return self.scan_encoder(scan)
 
 
+def apply_parkour_mts(
+    actor_observation: torch.Tensor,
+    predicted_yaw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the paper's oracle-yaw fallback during student rollouts."""
+    observation = actor_observation.clone()
+    predicted_yaw_rad = GO2_PARKOUR_YAW_SCALE * predicted_yaw
+    current_yaw_error = torch.atan2(
+        torch.sin(predicted_yaw_rad[..., 0] - observation[..., 6]),
+        torch.cos(predicted_yaw_rad[..., 0] - observation[..., 6]),
+    )
+    use_prediction = current_yaw_error.abs() < GO2_PARKOUR_MTS_THRESHOLD_RAD
+    observation[..., 6:8] = torch.where(
+        use_prediction[..., None],
+        predicted_yaw_rad,
+        observation[..., 6:8],
+    )
+    return observation, use_prediction
+
+
 __all__ = [
     "Actor",
     "StateHistoryEncoder",
+    "GO2_PARKOUR_MTS_THRESHOLD_RAD",
     "GO2_PARKOUR_PERCEPTION_DIM",
     "GO2_PARKOUR_PROPRIO_DIM",
     "GO2_PARKOUR_TERRAIN_LATENT_DIM",
     "GO2_PARKOUR_YAW_DIM",
+    "GO2_PARKOUR_YAW_SCALE",
+    "apply_parkour_mts",
 ]

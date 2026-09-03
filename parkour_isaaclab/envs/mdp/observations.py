@@ -62,10 +62,32 @@ class ExtremeParkourObservations(ManagerTermBase):
         env_idx_tensor = ~invert_env_idx_tensor
         roll, pitch, yaw = euler_xyz_from_quat(self.asset.data.root_quat_w)
         imu_obs = torch.stack((wrap_to_pi(roll), wrap_to_pi(pitch)), dim=1).to(self.device)
+        reset_ids = (env.episode_length_buf <= 1).nonzero(as_tuple=False).flatten()
         if env.common_step_counter % 5 == 0:
-            self.delta_yaw = self.parkour_event.target_yaw - wrap_to_pi(yaw)
-            self.delta_next_yaw = self.parkour_event.next_target_yaw - wrap_to_pi(yaw)
+            self.delta_yaw = wrap_to_pi(
+                self.parkour_event.target_yaw - wrap_to_pi(yaw)
+            )
+            self.delta_next_yaw = wrap_to_pi(
+                self.parkour_event.next_target_yaw - wrap_to_pi(yaw)
+            )
             self.measured_heights = self._get_heights()
+        if reset_ids.numel():
+            root_pos = (
+                self.asset.data.root_pos_w[reset_ids, :2]
+                - self.parkour_event.env_origins[reset_ids, :2]
+            )
+            current_delta = self.parkour_event.cur_goals[reset_ids, :2] - root_pos
+            next_delta = self.parkour_event.next_goals[reset_ids, :2] - root_pos
+            self.delta_yaw[reset_ids] = wrap_to_pi(
+                torch.atan2(current_delta[:, 1], current_delta[:, 0])
+                - wrap_to_pi(yaw[reset_ids])
+            )
+            self.delta_next_yaw[reset_ids] = wrap_to_pi(
+                torch.atan2(next_delta[:, 1], next_delta[:, 0])
+                - wrap_to_pi(yaw[reset_ids])
+            )
+            if env.common_step_counter % 5:
+                self.measured_heights[reset_ids] = self._get_heights()[reset_ids]
         commands = env.command_manager.get_command('base_velocity')
         obs_buf = torch.cat((
                             self.asset.data.root_ang_vel_b * 0.25,   #[1,3] 0~2
@@ -93,8 +115,8 @@ class ExtremeParkourObservations(ManagerTermBase):
         obs_buf[:, 6:8] = 0
         self._obs_history_buffer[:, :-1] = self._obs_history_buffer[:, 1:].clone()
         self._obs_history_buffer[:, -1] = obs_buf
-        reset_ids = env.episode_length_buf <= 1
-        self._obs_history_buffer[reset_ids] = obs_buf[reset_ids].unsqueeze(1)
+        reset_mask = env.episode_length_buf <= 1
+        self._obs_history_buffer[reset_mask] = obs_buf[reset_mask].unsqueeze(1)
         return observations 
 
     def _get_contact_fill(
