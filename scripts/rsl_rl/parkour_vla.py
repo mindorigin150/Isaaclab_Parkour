@@ -69,6 +69,7 @@ if __name__ == "__main__":
     parser.add_argument("--dagger_round", type=int, default=0)
     parser.add_argument("--dagger_row_budget", type=int, default=64_000)
     parser.add_argument("--dagger_shard_rows", type=int, default=1_000)
+    parser.add_argument("--startup-ready-file", type=Path)
     cli_args.add_rsl_rl_args(parser)
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()
@@ -915,6 +916,8 @@ def main() -> None:
 
     env, actor, teacher_policy, checkpoint = _load_environment_and_teacher()
     try:
+        if args_cli.startup_ready_file is not None:
+            args_cli.startup_ready_file.touch()
         if args_cli.mode == "collect":
             result = _collect(env, actor, teacher_policy, checkpoint)
         elif args_cli.mode == "dagger-collect":
