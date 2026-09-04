@@ -79,6 +79,45 @@ def test_eval_collects_exact_episode_budget_across_resets():
     assert result["edge_violation"]["mean"] == 0.0
 
 
+def test_profile_env_maps_latent_and_yaw_through_fixed_actor():
+    module = _load_parkour_vla_module()
+    module.PARKOUR_VLA_LATENT_DIM = 32
+    module.PARKOUR_VLA_YAW_DIM = 2
+    module.PARKOUR_VLA_PROPRIO_DIM = 53
+    module.GO2_PARKOUR_YAW_SCALE = 1.5
+    seen = []
+
+    class Env:
+        device = torch.device("cpu")
+
+        def step(self, action):
+            seen.append(action)
+            return (
+                torch.zeros(1, 53),
+                torch.tensor([2.0]),
+                torch.tensor([True]),
+                {},
+            )
+
+    class Actor:
+        def __call__(self, actor_obs, **kwargs):
+            seen.append((actor_obs, kwargs))
+            return torch.zeros(1, 12)
+
+    adapter = module._ParkourProfileEnv(Env(), Actor())
+    adapter._obs = torch.zeros(1, 53)
+    result = adapter.step(
+        module.Action(value=np.arange(34, dtype=np.float32))
+    )
+
+    assert result.done
+    assert result.reward == 2.0
+    actor_obs, kwargs = seen[0]
+    np.testing.assert_array_equal(kwargs["scandots_latent"].numpy(), np.arange(32)[None])
+    np.testing.assert_array_equal(actor_obs[0, 6:8].numpy(), np.arange(32, 34) * 1.5)
+    assert seen[1].shape == (1, 12)
+
+
 def test_vla_eval_refreshes_reset_slots_and_truncates_final_vector_step():
     module = _load_parkour_vla_module()
     module.GO2_PARKOUR_YAW_SCALE = 1.5

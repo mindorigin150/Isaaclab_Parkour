@@ -16,11 +16,15 @@ import sys
 from pathlib import Path
 
 PARKOUR_TASK = "Isaac-Extreme-Parkour-VLA-Unitree-Go2-v0"
-PARKOUR_EVAL_MODES = {"teacher-eval", "oracle-eval", "vla-eval"}
+PARKOUR_EVAL_MODES = {"teacher-eval", "oracle-eval", "vla-eval", "profile"}
 PARKOUR_ACTOR_OBSERVATION_DIM = 753
 REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from latency_bench.core.types import Action, Observation, StepResult
+from latency_bench.envs.base import EnvAdapter
+from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
 
 if __name__ == "__main__":
     from isaaclab.app import AppLauncher
@@ -36,6 +40,7 @@ if __name__ == "__main__":
             "collect",
             "vla-eval",
             "dagger-collect",
+            "profile",
         ),
     )
     parser.add_argument("--task", default=PARKOUR_TASK)
@@ -50,6 +55,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_episodes", type=int, default=25)
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--policy_config", type=Path)
+    parser.add_argument("--profile-config", type=Path)
     parser.add_argument("--inference_device", action="append")
     parser.add_argument("--inference_batch_size", type=int, default=8)
     parser.add_argument("--dagger_round", type=int, default=0)
@@ -138,6 +144,90 @@ def _load_environment_and_teacher():
     runner.load(resume_path, load_optimizer=False)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
     return env, runner.alg.policy.actor, policy, Path(resume_path)
+
+
+class _ParkourProfileEnv(EnvAdapter):
+    """Adapt the live Isaac Lab Go2 environment to the realtime executor."""
+
+    env_fps = 50.0
+    OBSERVATION_TYPE = "extreme_parkour_go2"
+
+    def __init__(self, env, actor):
+        self._env = env
+        self._actor = actor
+        self.noop_action = Action(
+            value=np.zeros(
+                PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM,
+                dtype=np.float32,
+            ),
+            name="noop",
+            is_noop=True,
+        )
+        self.env_step = 0
+        self._obs = None
+
+    def reset(self, seed: int | None = None) -> Observation:
+        if seed is not None:
+            self._env.seed(seed)
+        self._obs, _ = self._env.reset()
+        self.env_step = 0
+        return self.observe()
+
+    def observe(self) -> Observation:
+        rgb = _rgb_frames(self._env)
+        state = _masked_vla_state(
+            self._obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy()
+        )
+        return Observation(
+            data=None,
+            env_step=self.env_step,
+            sim_time_ms=self.env_step * 20.0,
+            metadata={
+                ENV_RAW_RGB_FRAME_STACK_INFO_KEY: rgb[0][None],
+                "parkour_proprio": state[0],
+                "slot_id": 0,
+            },
+        )
+
+    def step(self, action: Action) -> StepResult:
+        vla_action = torch.as_tensor(
+            action.value, device=self._env.device, dtype=self._obs.dtype
+        ).reshape(1, PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM)
+        latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
+        predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM:]
+        actor_observation = _actor_observation_with_yaw(self._obs, predicted_yaw)
+        with torch.inference_mode():
+            motor_action = self._actor(
+                actor_observation,
+                hist_encoding=True,
+                scandots_latent=latent,
+            )
+        self._obs, reward, dones, _ = self._env.step(motor_action)
+        self.env_step += 1
+        return StepResult(
+            observation=None,
+            reward=float(reward[0]),
+            done=bool(dones[0]),
+            truncated=False,
+        )
+
+    def render_game_frame(self):
+        return _rgb_frames(self._env)[0]
+
+    def close(self) -> None:
+        self._env.close()
+
+
+def _run_profile(profile_config: dict, env, actor) -> dict:
+    from latency_bench.eval.driver import run_from_config
+
+    profile_env = _ParkourProfileEnv(env, actor)
+    run_from_config(
+        profile_config,
+        env=profile_env,
+        inference_devices=profile_config["executor"]["inference_devices"],
+    )
+    return {"output_dir": profile_config["logging"]["output_dir"]}
 
 
 def _rgb_frames(env) -> np.ndarray:
@@ -799,12 +889,27 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
 
 
 def main() -> None:
+    from latency_bench.core.config import load_config
+
+    profile_config = None
+    if args_cli.mode == "profile":
+        profile_config = load_config(args_cli.profile_config)
+        args_cli.policy_config = args_cli.profile_config
+        args_cli.checkpoint = profile_config["env"]["runtime_checkpoint_path"]
+        args_cli.num_envs = 1
+        args_cli.eval_episodes = profile_config["evaluation"]["eval_episodes"]
+        args_cli.max_episode_steps = profile_config["evaluation"]["eval_max_steps"]
+        args_cli.seed = profile_config["experiment"]["seed"]
+        args_cli.device = profile_config["env"]["simulator_device"]
+
     env, actor, teacher_policy, checkpoint = _load_environment_and_teacher()
     try:
         if args_cli.mode == "collect":
             result = _collect(env, actor, teacher_policy, checkpoint)
         elif args_cli.mode == "dagger-collect":
             result = _collect_dagger(env, actor, teacher_policy, checkpoint)
+        elif args_cli.mode == "profile":
+            result = _run_profile(profile_config, env, actor)
         else:
             result = _evaluate(
                 env,
