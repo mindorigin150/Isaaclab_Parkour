@@ -19,8 +19,15 @@ PARKOUR_TASK = "Isaac-Extreme-Parkour-VLA-Unitree-Go2-v0"
 PARKOUR_EVAL_MODES = {"teacher-eval", "oracle-eval", "vla-eval", "profile"}
 PARKOUR_ACTOR_OBSERVATION_DIM = 753
 REPO_ROOT = Path(__file__).resolve().parents[4]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+PARKOUR_REPO_ROOT = Path(__file__).resolve().parents[2]
+PARKOUR_TASKS_ROOT = PARKOUR_REPO_ROOT / "parkour_tasks"
+for import_root in map(
+    str,
+    (REPO_ROOT, PARKOUR_REPO_ROOT, PARKOUR_TASKS_ROOT),
+):
+    if import_root in sys.path:
+        sys.path.remove(import_root)
+sys.path[:0] = [str(PARKOUR_TASKS_ROOT), str(PARKOUR_REPO_ROOT), str(REPO_ROOT)]
 
 from latency_bench.core.types import Action, Observation, StepResult
 from latency_bench.envs.base import EnvAdapter
@@ -155,6 +162,10 @@ class _ParkourProfileEnv(EnvAdapter):
     def __init__(self, env, actor):
         self._env = env
         self._actor = actor
+        self._edge_term = env.unwrapped.reward_manager.get_term_cfg(
+            "reward_feet_edge"
+        ).func
+        self._parkour = env.unwrapped.parkour_manager.get_term("base_parkour")
         self.noop_action = Action(
             value=np.zeros(
                 PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM,
@@ -164,6 +175,8 @@ class _ParkourProfileEnv(EnvAdapter):
             is_noop=True,
         )
         self.env_step = 0
+        self._episode_edge_sum = 0.0
+        self._episode_edge_steps = 0
         self._obs = None
 
     def reset(self, seed: int | None = None) -> Observation:
@@ -171,6 +184,8 @@ class _ParkourProfileEnv(EnvAdapter):
             self._env.seed(seed)
         self._obs, _ = self._env.reset()
         self.env_step = 0
+        self._episode_edge_sum = 0.0
+        self._episode_edge_steps = 0
         return self.observe()
 
     def observe(self) -> Observation:
@@ -190,6 +205,7 @@ class _ParkourProfileEnv(EnvAdapter):
         )
 
     def step(self, action: Action) -> StepResult:
+        goal_index = self._parkour.cur_goal_idx.clone()
         vla_action = torch.as_tensor(
             action.value, device=self._env.device, dtype=self._obs.dtype
         ).reshape(1, PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM)
@@ -203,12 +219,28 @@ class _ParkourProfileEnv(EnvAdapter):
                 scandots_latent=latent,
             )
         self._obs, reward, dones, _ = self._env.step(motor_action)
+        successes = self._env.unwrapped.termination_manager.get_term(
+            "parkour_success"
+        )
+        edge = self._edge_term.feet_at_edge.sum(dim=1).float()
+        self._episode_edge_sum += float(edge[0])
+        self._episode_edge_steps += 1
         self.env_step += 1
         return StepResult(
             observation=None,
             reward=float(reward[0]),
             done=bool(dones[0]),
             truncated=False,
+            info={
+                "task_metrics": {
+                    "normalized_waypoint_progress": float(
+                        (goal_index[0] + successes[0].long()).float()
+                        / self._parkour.num_goals
+                    ),
+                    "edge_violation": self._episode_edge_sum
+                    / self._episode_edge_steps,
+                }
+            },
         )
 
     def render_game_frame(self):

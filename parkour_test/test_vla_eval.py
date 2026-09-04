@@ -90,12 +90,45 @@ def test_profile_env_maps_latent_and_yaw_through_fixed_actor():
     class Env:
         device = torch.device("cpu")
 
+        def __init__(self):
+            self.step_count = 0
+            self.edge = SimpleNamespace(
+                feet_at_edge=torch.zeros((1, 4), dtype=torch.bool)
+            )
+            self.parkour = SimpleNamespace(
+                cur_goal_idx=torch.tensor([1]), num_goals=4
+            )
+            self.success = torch.tensor([False])
+            self.unwrapped = SimpleNamespace(
+                reward_manager=SimpleNamespace(
+                    get_term_cfg=lambda _name: SimpleNamespace(func=self.edge)
+                ),
+                parkour_manager=SimpleNamespace(
+                    get_term=lambda _name: self.parkour
+                ),
+                termination_manager=SimpleNamespace(
+                    get_term=lambda _name: self.success
+                ),
+            )
+
+        def reset(self):
+            self.step_count = 0
+            self.parkour.cur_goal_idx = torch.tensor([1])
+            self.success = torch.tensor([False])
+            self.edge.feet_at_edge = torch.zeros((1, 4), dtype=torch.bool)
+            return torch.zeros(1, 53), {}
+
         def step(self, action):
             seen.append(action)
+            self.step_count += 1
+            self.edge.feet_at_edge = torch.tensor(
+                [[True, True, self.step_count > 1, self.step_count > 1]]
+            )
+            self.success = torch.tensor([self.step_count == 1])
             return (
                 torch.zeros(1, 53),
                 torch.tensor([2.0]),
-                torch.tensor([True]),
+                torch.tensor([self.step_count == 1]),
                 {},
             )
 
@@ -104,7 +137,8 @@ def test_profile_env_maps_latent_and_yaw_through_fixed_actor():
             seen.append((actor_obs, kwargs))
             return torch.zeros(1, 12)
 
-    adapter = module._ParkourProfileEnv(Env(), Actor())
+    env = Env()
+    adapter = module._ParkourProfileEnv(env, Actor())
     adapter._obs = torch.zeros(1, 53)
     result = adapter.step(
         module.Action(value=np.arange(34, dtype=np.float32))
@@ -112,10 +146,25 @@ def test_profile_env_maps_latent_and_yaw_through_fixed_actor():
 
     assert result.done
     assert result.reward == 2.0
+    assert result.info["task_metrics"] == {
+        "normalized_waypoint_progress": 0.5,
+        "edge_violation": 2.0,
+    }
     actor_obs, kwargs = seen[0]
     np.testing.assert_array_equal(kwargs["scandots_latent"].numpy(), np.arange(32)[None])
     np.testing.assert_array_equal(actor_obs[0, 6:8].numpy(), np.arange(32, 34) * 1.5)
     assert seen[1].shape == (1, 12)
+
+    env.success = torch.tensor([False])
+    env.edge.feet_at_edge = torch.tensor([[True, True, True, True]])
+    result = adapter.step(module.Action(value=np.zeros(34, dtype=np.float32)))
+    assert result.info["task_metrics"]["normalized_waypoint_progress"] == 0.25
+    assert result.info["task_metrics"]["edge_violation"] == 3.0
+
+    module._rgb_frames = lambda _env: np.zeros((1, 1, 1, 3), dtype=np.uint8)
+    adapter.reset()
+    assert adapter._episode_edge_sum == 0.0
+    assert adapter._episode_edge_steps == 0
 
 
 def test_vla_eval_refreshes_reset_slots_and_truncates_final_vector_step():
