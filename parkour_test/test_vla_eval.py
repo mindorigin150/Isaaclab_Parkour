@@ -18,6 +18,7 @@ def _load_parkour_vla_module():
     module.PARKOUR_VLA_CONTROL_REPEAT = 5
     module.PARKOUR_VLA_LATENT_DIM = 32
     module.PARKOUR_VLA_YAW_DIM = 2
+    module.PARKOUR_VLA_ACTION_DIM = 34
     return module
 
 
@@ -178,7 +179,7 @@ def test_vla_eval_refreshes_reset_slots_and_truncates_final_vector_step():
 
     def predict(pool, rgb, state, slots, step):
         calls.append((step, slots))
-        return np.zeros((len(slots), 34), dtype=np.float32)
+        return np.zeros((len(slots), 40, 34), dtype=np.float32)
 
     module._predict_vla_outputs = predict
 
@@ -193,6 +194,39 @@ def test_vla_eval_refreshes_reset_slots_and_truncates_final_vector_step():
     assert result["episodes"] == 100
     assert len(calls) == 34
     assert all(slots == [0, 1, 2] for _, slots in calls)
+
+
+def test_vla_eval_executes_five_chunk_entries_before_replanning():
+    module = _load_parkour_vla_module()
+    module.args_cli.eval_episodes = 1
+    module.GO2_PARKOUR_YAW_SCALE = 1.5
+    module.PARKOUR_VLA_PROPRIO_DIM = 53
+    module._new_policy_pool = lambda: [SimpleNamespace(close=lambda: None)]
+    module._rgb_frames = lambda env: np.zeros((env.num_envs, 1, 1, 3))
+    calls = []
+    executed = []
+
+    def predict(pool, rgb, state, slots, step):
+        calls.append((step, slots))
+        chunk = np.zeros((len(slots), 40, 34), dtype=np.float32)
+        chunk[:, :, 0] = np.arange(40)
+        return chunk
+
+    def policy(obs, *, scandots_latent, **kwargs):
+        executed.append(float(scandots_latent[0, 0]))
+        return torch.zeros((len(obs), 12))
+
+    module._predict_vla_outputs = predict
+    module._evaluate(
+        _FakeEnv(limits=(6, 100, 100)),
+        actor=None,
+        teacher_policy=policy,
+        use_oracle=False,
+        use_vla=True,
+    )
+
+    assert executed == [0.0, 1.0, 2.0, 3.0, 4.0, 0.0]
+    assert calls == [(0, [0, 1, 2]), (5, [0, 1, 2])]
 
 
 def test_bootstrap_refreshes_camera_once_per_five_control_steps(tmp_path):
@@ -360,9 +394,7 @@ def test_multi_pool_prediction_keeps_slot_affinity_and_request_order():
                 time.sleep(0.01)
             return [
                 SimpleNamespace(
-                    action=SimpleNamespace(
-                        value=np.full(34, slot, dtype=np.float32)
-                    )
+                    action_chunk=np.full((40, 34), slot, dtype=np.float32)
                 )
                 for slot in slots
             ]
@@ -374,7 +406,81 @@ def test_multi_pool_prediction_keeps_slot_affinity_and_request_order():
     output = module._predict_vla_outputs(pools, rgb, state, [7, 2, 5, 0], 10)
     reset_output = module._predict_vla_outputs(pools, rgb, state, [2, 7], 11)
 
-    np.testing.assert_array_equal(output[:, 0], [7, 2, 5, 0])
-    np.testing.assert_array_equal(reset_output[:, 0], [2, 7])
+    assert output.shape == (4, 40, 34)
+    np.testing.assert_array_equal(output[:, 0, 0], [7, 2, 5, 0])
+    np.testing.assert_array_equal(reset_output[:, 0, 0], [2, 7])
     assert pools[0].slots == [2, 0, 2]
     assert pools[1].slots == [7, 5, 7]
+
+
+def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_path):
+    module = _load_parkour_vla_module()
+    module.args_cli.output_dir = tmp_path / "dagger"
+    module.args_cli.dagger_row_budget = 4
+    module.args_cli.dagger_shard_rows = 1000
+    module.args_cli.dagger_round = 0
+    module.args_cli.inference_batch_size = 8
+    module.GO2_PARKOUR_YAW_SCALE = 1.5
+    module.GO2_PARKOUR_MTS_THRESHOLD_RAD = 0.6
+    module.PARKOUR_VLA_ACTION_DIM = 34
+    module.PARKOUR_VLA_PROPRIO_DIM = 53
+    module.PARKOUR_VLA_PROMPT = "parkour"
+    module.simulation_app = SimpleNamespace(is_running=lambda: True)
+    module._new_policy_pool = lambda: [SimpleNamespace(close=lambda: None)]
+    module._rgb_frames = lambda env: np.zeros((env.num_envs, 1, 1, 3))
+    module.apply_parkour_mts = lambda obs, yaw: (
+        obs,
+        torch.ones(len(obs), dtype=torch.bool),
+    )
+    written = []
+    module._write_dagger_shard = (
+        lambda output, index, rows, **kwargs: written.append(rows)
+    )
+
+    def predict(pool, rgb, state, slots, step):
+        chunk = np.zeros((len(slots), 40, 34), dtype=np.float32)
+        chunk[:, :, 0] = np.arange(40)
+        return chunk
+
+    module._predict_vla_outputs = predict
+    executed = []
+
+    class Env:
+        num_envs = 2
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.elapsed = torch.zeros(2, dtype=torch.long)
+
+        def observations(self):
+            obs = torch.zeros((2, 753))
+            obs[:, 0] = torch.arange(2)
+            return obs
+
+        def get_observations(self):
+            return self.observations(), {}
+
+        def step(self, actions):
+            self.elapsed += 1
+            dones = self.elapsed == torch.tensor([6, 100])
+            self.elapsed[dones] = 0
+            return self.observations(), torch.zeros(2), dones.long(), {}
+
+    def policy(obs, *, scandots_latent, **kwargs):
+        executed.append(float(scandots_latent[0, 0]))
+        return torch.zeros((len(obs), 12))
+
+    actor = SimpleNamespace(
+        infer_scandots_latent=lambda obs: torch.zeros((len(obs), 32))
+    )
+    result = module._collect_dagger(Env(), actor, policy, Path("teacher.pt"))
+
+    assert result["schema_version"] == 6
+    assert result["rows"] == 4
+    assert executed[:6] == [0.0, 1.0, 2.0, 3.0, 4.0, 0.0]
+    assert sorted(len(rows) for rows in written) == [2, 2]
+    for rows in written:
+        assert len({float(row["observation.state"][0]) for row in rows}) == 1
+        assert all(row["actor_observation"].shape == (5, 753) for row in rows)
+        assert all(row["termination"].shape == (5,) for row in rows)
+        assert rows[-1]["termination"][-1]

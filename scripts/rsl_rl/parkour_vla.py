@@ -30,6 +30,7 @@ for import_root in map(
 sys.path[:0] = [str(PARKOUR_TASKS_ROOT), str(PARKOUR_REPO_ROOT), str(REPO_ROOT)]
 
 from latency_bench.core.types import Action, Observation, StepResult
+from latency_bench.data.parkour_dagger import PARKOUR_ACTION_HORIZON
 from latency_bench.envs.base import EnvAdapter
 from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
 
@@ -337,7 +338,7 @@ def _predict_vla_outputs(
                 _policy_observations(rgb, state, batch_slots, step)
             )
             outputs_by_slot.update(
-                (slot, np.asarray(output.action.value, dtype=np.float32))
+                (slot, np.asarray(output.action_chunk, dtype=np.float32))
                 for slot, output in zip(batch_slots, outputs)
             )
         return outputs_by_slot
@@ -403,12 +404,18 @@ def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) ->
     pool = _new_policy_pool() if use_vla else None
     obs, _ = env.get_observations()
     num_envs = env.num_envs
+    all_ids = torch.arange(num_envs, device=env.device)
     phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
     latent = torch.zeros(
         (num_envs, PARKOUR_VLA_LATENT_DIM), dtype=obs.dtype, device=env.device
     )
     predicted_yaw = torch.zeros(
         (num_envs, PARKOUR_VLA_YAW_DIM), dtype=obs.dtype, device=env.device
+    )
+    action_chunk = torch.zeros(
+        (num_envs, PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM),
+        dtype=obs.dtype,
+        device=env.device,
     )
     returns = torch.zeros(num_envs, dtype=torch.float, device=env.device)
     lengths = torch.zeros(num_envs, dtype=torch.float, device=env.device)
@@ -436,12 +443,12 @@ def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) ->
                         slots,
                         step,
                     )
-                    latent[due_ids] = torch.from_numpy(
-                        predicted[:, :PARKOUR_VLA_LATENT_DIM]
-                    ).to(env.device)
-                    predicted_yaw[due_ids] = torch.from_numpy(
-                        predicted[:, PARKOUR_VLA_LATENT_DIM :]
-                    ).to(env.device)
+                    action_chunk[due_ids] = torch.from_numpy(predicted).to(env.device)
+
+                if use_vla:
+                    vla_action = action_chunk[all_ids, phase]
+                    latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
+                    predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM :]
 
                 actor_obs = (
                     _actor_observation_with_yaw(obs, predicted_yaw)
@@ -711,7 +718,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
     target_rows = args_cli.dagger_row_budget
     if row_count >= target_rows:
         return {
-            "schema_version": 5,
+            "schema_version": 6,
             "round": args_cli.dagger_round,
             "rows": row_count,
             "control_steps": row_count * PARKOUR_VLA_CONTROL_REPEAT,
@@ -728,152 +735,124 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
     obs, _ = env.get_observations()
     num_envs = env.num_envs
     all_ids = torch.arange(num_envs, device=env.device)
-    latent = torch.zeros(
-        (num_envs, PARKOUR_VLA_LATENT_DIM), dtype=obs.dtype, device=env.device
+    phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
+    action_chunk = torch.zeros(
+        (num_envs, PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM),
+        dtype=obs.dtype,
+        device=env.device,
     )
-    predicted_yaw = torch.zeros(
-        (num_envs, PARKOUR_VLA_YAW_DIM), dtype=obs.dtype, device=env.device
-    )
-    oracle_latent = torch.zeros_like(latent)
-    rows: list[dict] = []
+    episode_rows: list[list[dict]] = [[] for _ in range(num_envs)]
+    active_rows: list[dict | None] = [None] * num_envs
+    started_rows = row_count
+    completed_rows = row_count
     control_step = 0
     mts_prediction_count = 0
     mts_total_count = 0
     all_slots = list(range(num_envs))
 
+    def flush_slot(slot: int) -> None:
+        nonlocal row_count, shard_index
+        rows = episode_rows[slot]
+        if not rows:
+            return
+        rows[-1]["termination"][-1] = True
+        _write_dagger_shard(output_dir, shard_index, rows)
+        row_count += len(rows)
+        shard_index += 1
+        episode_rows[slot] = []
+
     try:
-        while row_count + len(rows) < target_rows and simulation_app.is_running():
-            rgb = _rgb_frames(env)
+        while completed_rows < target_rows and simulation_app.is_running():
             state_cpu = obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy()
-            slots = all_slots
-            remaining = target_rows - row_count - len(rows)
-            selected_count = min(remaining, num_envs)
-            selected_ids = all_ids[:selected_count]
-            selected = all_slots[:selected_count]
-            with torch.inference_mode():
-                predicted = _predict_vla_outputs(
-                    pool,
-                    rgb,
-                    state_cpu,
-                    slots,
-                    control_step,
-                )
-                latent[:] = torch.from_numpy(
-                    predicted[:, :PARKOUR_VLA_LATENT_DIM]
-                ).to(env.device)
-                predicted_yaw[:] = torch.from_numpy(
-                    predicted[:, PARKOUR_VLA_LATENT_DIM :]
-                ).to(env.device)
-                oracle_latent[:] = actor.infer_scandots_latent(obs)
-
-            if selected:
-                selected_states = _masked_vla_state(state_cpu[selected])
-                selected_actions = np.concatenate(
-                    (
-                        oracle_latent[selected_ids].detach().cpu().numpy(),
-                        state_cpu[selected, 6:8] / GO2_PARKOUR_YAW_SCALE,
-                    ),
-                    axis=1,
-                )
-                row_data = {
-                    slot: {
-                        "rgb": rgb[slot],
-                        "observation.state": state,
-                        "action": action,
-                        "actor_observation": [],
-                        "termination": [],
-                    }
-                    for slot, state, action in zip(
-                        selected, selected_states, selected_actions
-                    )
-                }
-            else:
-                row_data = {}
-
-            for repeat_index in range(PARKOUR_VLA_CONTROL_REPEAT):
-                selected_actor_observations = (
-                    obs[selected_ids].detach().cpu().numpy()
-                )
-                for slot, actor_observation in zip(
-                    selected,
-                    selected_actor_observations,
-                ):
-                    row_data[slot]["actor_observation"].append(actor_observation)
+            due_ids = (phase == 0).nonzero(as_tuple=False).flatten()
+            due_slots = due_ids.cpu().tolist()
+            if due_slots:
+                rgb = _rgb_frames(env)
                 with torch.inference_mode():
-                    actor_observation, use_prediction = apply_parkour_mts(
-                        obs,
-                        predicted_yaw,
-                    )
-                    mts_prediction_count += use_prediction.sum().item()
-                    mts_total_count += use_prediction.numel()
-                    actions = teacher_policy(
-                        actor_observation,
-                        hist_encoding=True,
-                        scandots_latent=latent,
-                    )
-                obs, _, dones, _ = env.step(actions)
-
-                dones_cpu = dones.detach().cpu().numpy().astype(bool)
-                if selected:
-                    selected_terminations = dones_cpu[selected].tolist()
-                    for slot, termination in zip(
-                        selected,
-                        selected_terminations,
-                    ):
-                        row_data[slot]["termination"].append(termination)
-
-                control_step += 1
-                reset_ids = dones.nonzero(as_tuple=False).flatten()
-                if reset_ids.numel() and repeat_index + 1 < PARKOUR_VLA_CONTROL_REPEAT:
-                    reset_rgb = _rgb_frames(env)
-                    slots = reset_ids.cpu().tolist()
-                    reset_state_cpu = (
-                        obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy()
-                    )
                     predicted = _predict_vla_outputs(
                         pool,
-                        reset_rgb,
-                        reset_state_cpu,
-                        slots,
+                        rgb,
+                        state_cpu,
+                        due_slots,
                         control_step,
                     )
-                    latent[reset_ids] = torch.from_numpy(
-                        predicted[:, :PARKOUR_VLA_LATENT_DIM]
-                    ).to(env.device)
-                    predicted_yaw[reset_ids] = torch.from_numpy(
-                        predicted[:, PARKOUR_VLA_LATENT_DIM :]
-                    ).to(env.device)
-            for slot in selected:
-                row = row_data[slot]
-                row["actor_observation"] = np.asarray(
-                    row["actor_observation"], dtype=np.float32
-                )
-                row["termination"] = np.asarray(row["termination"], dtype=bool)
-                rows.append(row)
+                    action_chunk[due_ids] = torch.from_numpy(predicted).to(env.device)
 
-            if len(rows) >= args_cli.dagger_shard_rows:
-                count = args_cli.dagger_shard_rows
-                _write_dagger_shard(
-                    output_dir,
-                    shard_index,
-                    rows[:count],
+                    record_slots = due_slots[: target_rows - started_rows]
+                    if record_slots:
+                        record_ids = all_ids[record_slots]
+                        oracle_latent = actor.infer_scandots_latent(obs[record_ids])
+                        actions = np.concatenate(
+                            (
+                                oracle_latent.detach().cpu().numpy(),
+                                state_cpu[record_slots, 6:8] / GO2_PARKOUR_YAW_SCALE,
+                            ),
+                            axis=1,
+                        )
+                        states = _masked_vla_state(state_cpu[record_slots])
+                        for slot, state, action in zip(record_slots, states, actions):
+                            active_rows[slot] = {
+                                "rgb": rgb[slot],
+                                "observation.state": state,
+                                "action": action,
+                                "actor_observation": [],
+                                "termination": [],
+                            }
+                        started_rows += len(record_slots)
+
+            actor_observations = obs.detach().cpu().numpy()
+            for slot, row in enumerate(active_rows):
+                if row is not None:
+                    row["actor_observation"].append(actor_observations[slot].copy())
+
+            vla_action = action_chunk[all_ids, phase]
+            latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
+            predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM :]
+            with torch.inference_mode():
+                actor_observation, use_prediction = apply_parkour_mts(obs, predicted_yaw)
+                mts_prediction_count += use_prediction.sum().item()
+                mts_total_count += use_prediction.numel()
+                actions = teacher_policy(
+                    actor_observation,
+                    hist_encoding=True,
+                    scandots_latent=latent,
                 )
-                row_count += count
-                rows = rows[count:]
-                shard_index += 1
+            obs, _, dones, _ = env.step(actions)
+
+            dones_cpu = dones.detach().cpu().numpy().astype(bool)
+            phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
+            phase[dones.bool()] = 0
+            control_step += 1
+
+            for slot, row in enumerate(active_rows):
+                if row is None:
+                    continue
+                terminated = bool(dones_cpu[slot])
+                row["termination"].append(terminated)
+                if terminated:
+                    while len(row["termination"]) < PARKOUR_VLA_CONTROL_REPEAT:
+                        row["actor_observation"].append(
+                            row["actor_observation"][-1].copy()
+                        )
+                        row["termination"].append(True)
+                if terminated or phase[slot] == 0:
+                    row["actor_observation"] = np.asarray(
+                        row["actor_observation"], dtype=np.float32
+                    )
+                    row["termination"] = np.asarray(row["termination"], dtype=bool)
+                    episode_rows[slot].append(row)
+                    active_rows[slot] = None
+                    completed_rows += 1
+                    if terminated or len(episode_rows[slot]) == args_cli.dagger_shard_rows:
+                        flush_slot(slot)
 
     finally:
-        if rows:
-            _write_dagger_shard(
-                output_dir,
-                shard_index,
-                rows,
-            )
-            row_count += len(rows)
+        for slot in all_slots:
+            flush_slot(slot)
         _close_policy_pool(pool)
 
     metadata = {
-        "schema_version": 5,
+        "schema_version": 6,
         "env_name": "extreme_parkour_go2",
         "integration_name": "isaaclab_parkour",
         "round": args_cli.dagger_round,
