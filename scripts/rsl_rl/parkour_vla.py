@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping, Sequence
 import json
 import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import gymnasium as gym
+
 PARKOUR_TASK = "Isaac-Extreme-Parkour-VLA-Unitree-Go2-v0"
-PARKOUR_EVAL_MODES = {"teacher-eval", "oracle-eval", "vla-eval", "profile"}
+PARKOUR_EVAL_MODES = {"teacher-eval", "oracle-eval", "latency-eval"}
 PARKOUR_ACTOR_OBSERVATION_DIM = 753
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PARKOUR_REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -29,10 +33,11 @@ for import_root in map(
         sys.path.remove(import_root)
 sys.path[:0] = [str(PARKOUR_TASKS_ROOT), str(PARKOUR_REPO_ROOT), str(REPO_ROOT)]
 
+from latency_bench.core.latency_distribution import derive_seed
 from latency_bench.core.types import Action, Observation, StepResult
 from latency_bench.data.parkour_dagger import PARKOUR_ACTION_HORIZON
-from latency_bench.envs.base import EnvAdapter
 from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
+from latency_bench.executors.env_step_backend import EnvStepResponse, RemoteEnvSlotHandle
 
 if __name__ == "__main__":
     from isaaclab.app import AppLauncher
@@ -46,9 +51,8 @@ if __name__ == "__main__":
             "teacher-eval",
             "oracle-eval",
             "collect",
-            "vla-eval",
             "dagger-collect",
-            "profile",
+            "latency-eval",
         ),
     )
     parser.add_argument("--task", default=PARKOUR_TASK)
@@ -63,7 +67,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_episodes", type=int, default=25)
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--policy_config", type=Path)
-    parser.add_argument("--profile-config", type=Path)
+    parser.add_argument("--eval-config", type=Path)
     parser.add_argument("--inference_device", action="append")
     parser.add_argument("--inference_batch_size", type=int, default=8)
     parser.add_argument("--dagger_round", type=int, default=0)
@@ -155,113 +159,236 @@ def _load_environment_and_teacher():
     return env, runner.alg.policy.actor, policy, Path(resume_path)
 
 
-class _ParkourProfileEnv(EnvAdapter):
-    """Adapt the live Isaac Lab Go2 environment to the realtime executor."""
+def _parkour_actor_action(env, actor, observation, action_value):
+    vla_action = torch.as_tensor(
+        action_value, device=env.device, dtype=observation.dtype
+    ).reshape(-1, PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM)
+    latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
+    predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM:]
+    actor_observation = _actor_observation_with_yaw(observation, predicted_yaw)
+    with torch.inference_mode():
+        return actor(
+            actor_observation,
+            hist_encoding=True,
+            scandots_latent=latent,
+        )
 
-    env_fps = 50.0
-    OBSERVATION_TYPE = "extreme_parkour_go2"
 
-    def __init__(self, env, actor):
+class ParkourEnvStepBackend:
+    """Expose the Isaac Lab vector scene through the common eval contract."""
+
+    backend_name = "isaaclab_parkour"
+
+    def __init__(self, env, actor, *, noop_action: Action):
         self._env = env
+        self._raw_env = env.unwrapped
         self._actor = actor
-        self._edge_term = env.unwrapped.reward_manager.get_term_cfg(
+        self._num_slots = int(env.num_envs)
+        self._env_fps = 1.0 / float(self._raw_env.step_dt)
+        self._frame_ms = 1000.0 / self._env_fps
+        self.noop_action = noop_action
+        self.closed = False
+        self.last_step_metadata_by_slot: dict[int, dict[str, object]] = {}
+        self._obs, _ = env.get_observations()
+        self._edge_term = self._raw_env.reward_manager.get_term_cfg(
             "reward_feet_edge"
         ).func
-        self._parkour = env.unwrapped.parkour_manager.get_term("base_parkour")
-        self.noop_action = Action(
-            value=np.zeros(
-                PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM,
-                dtype=np.float32,
-            ),
-            name="noop",
-            is_noop=True,
+        self._parkour = self._raw_env.parkour_manager.get_term("base_parkour")
+        self._edge_sum = torch.zeros(self._num_slots, dtype=torch.float64)
+        self._edge_sq_sum = torch.zeros(self._num_slots, dtype=torch.float64)
+        self._edge_steps = torch.zeros(self._num_slots, dtype=torch.int64)
+        self.slot_handles = [
+            RemoteEnvSlotHandle(
+                slot_id=slot_id,
+                env_fps=self._env_fps,
+                noop_action=noop_action,
+                action_space=gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM,),
+                    dtype=np.float32,
+                ),
+            )
+            for slot_id in range(self._num_slots)
+        ]
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
+    @property
+    def env_fps(self) -> float:
+        return self._env_fps
+
+    def worker_pids(self) -> list[int]:
+        return []
+
+    def reset_slot(
+        self, slot_id: int, *, episode_id: int, seed: int | None
+    ) -> Observation:
+        self._raise_if_closed()
+        slot_id = int(slot_id)
+        env_ids = torch.tensor(
+            [slot_id], dtype=torch.int64, device=self._raw_env.device
         )
-        self.env_step = 0
-        self._episode_edge_sum = 0.0
-        self._episode_edge_steps = 0
-        self._obs = None
+        obs_dict, _ = self._raw_env.reset(seed=seed, env_ids=env_ids)
+        self._obs = obs_dict["policy"]
+        self._edge_sum[slot_id] = 0.0
+        self._edge_sq_sum[slot_id] = 0.0
+        self._edge_steps[slot_id] = 0
+        observation = self._make_observation(slot_id, episode_id=episode_id)
+        self.slot_handles[slot_id].update_observation(observation)
+        return observation
 
-    def reset(self, seed: int | None = None) -> Observation:
-        if seed is not None:
-            self._env.seed(seed)
-        self._obs, _ = self._env.reset()
-        self.env_step = 0
-        self._episode_edge_sum = 0.0
-        self._episode_edge_steps = 0
-        return self.observe()
-
-    def observe(self) -> Observation:
+    def observe_slots(self, slot_ids: Sequence[int]) -> dict[int, Observation]:
+        self._raise_if_closed()
         rgb = _rgb_frames(self._env)
+        observations = {
+            int(slot_id): self._make_observation(int(slot_id), rgb=rgb)
+            for slot_id in slot_ids
+        }
+        for slot_id, observation in observations.items():
+            self.slot_handles[slot_id].update_observation(observation)
+        return observations
+
+    def step_slots(
+        self, actions_by_slot: Mapping[int, Action]
+    ) -> dict[int, EnvStepResponse]:
+        self._raise_if_closed()
+        start = time.perf_counter()
+        slot_ids = [int(slot_id) for slot_id in actions_by_slot]
+        goal_index = self._parkour.cur_goal_idx.clone()
+        vla_action = torch.zeros(
+            (self._num_slots, PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM),
+            dtype=self._obs.dtype,
+            device=self._obs.device,
+        )
+        for slot_id, action in actions_by_slot.items():
+            vla_action[int(slot_id)] = torch.as_tensor(
+                np.asarray(action.value, dtype=np.float32),
+                dtype=self._obs.dtype,
+                device=self._obs.device,
+            )
+        motor_action = _parkour_actor_action(
+            self._env, self._actor, self._obs, vla_action
+        )
+        obs_dict, rewards, terminated, truncated, _extras = self._raw_env.step_no_reset(
+            motor_action
+        )
+        self._obs = obs_dict["policy"]
+        successes = self._raw_env.termination_manager.get_term("parkour_success")
+        edge = self._edge_term.feet_at_edge.sum(dim=1).to(dtype=torch.float64)
+        for slot_id in slot_ids:
+            value = float(edge[slot_id])
+            self._edge_sum[slot_id] += value
+            self._edge_sq_sum[slot_id] += value * value
+            self._edge_steps[slot_id] += 1
+
+        elapsed = time.perf_counter() - start
+        responses: dict[int, EnvStepResponse] = {}
+        for slot_id in slot_ids:
+            slot_id = int(slot_id)
+            count = int(self._edge_steps[slot_id])
+            progress = float(
+                (goal_index[slot_id] + successes[slot_id].long()).float()
+                / self._parkour.num_goals
+            )
+            info = {
+                "task_metrics": {
+                    "normalized_waypoint_progress": progress,
+                    "edge_violation": float(self._edge_sum[slot_id]) / count,
+                },
+                "task_metric_moments": {
+                    "edge_violation": {
+                        "sum": float(self._edge_sum[slot_id]),
+                        "sum_sq": float(self._edge_sq_sum[slot_id]),
+                        "count": count,
+                    }
+                },
+                "env_step": int(self._raw_env.episode_length_buf[slot_id]),
+                "sim_time_ms": float(self._raw_env.episode_length_buf[slot_id])
+                * self._frame_ms,
+                "applied_action": np.asarray(actions_by_slot[slot_id].value).tolist(),
+                "applied_action_name": actions_by_slot[slot_id].name,
+            }
+            result = StepResult(
+                observation=None,
+                reward=float(rewards[slot_id]),
+                done=bool(terminated[slot_id]),
+                truncated=bool(truncated[slot_id]),
+                info=info,
+            )
+            metadata = {
+                "backend": self.backend_name,
+                "slot_id": slot_id,
+                "worker_pid": None,
+                "worker_step_wall_sec": elapsed,
+            }
+            self.last_step_metadata_by_slot[slot_id] = metadata
+            responses[slot_id] = EnvStepResponse(
+                result=result,
+                worker_pid=None,
+                metadata=metadata,
+            )
+        return responses
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._env.close()
+
+    def _make_observation(
+        self,
+        slot_id: int,
+        *,
+        episode_id: int | None = None,
+        rgb: np.ndarray | None = None,
+    ) -> Observation:
+        if rgb is None:
+            rgb = _rgb_frames(self._env)
         state = _masked_vla_state(
             self._obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy()
         )
+        metadata = {
+            ENV_RAW_RGB_FRAME_STACK_INFO_KEY: rgb[slot_id][None],
+            "parkour_proprio": state[slot_id],
+            "slot_id": slot_id,
+        }
+        if episode_id is not None:
+            metadata["episode_id"] = int(episode_id)
+        env_step = int(self._raw_env.episode_length_buf[slot_id])
         return Observation(
             data=None,
-            env_step=self.env_step,
-            sim_time_ms=self.env_step * 20.0,
-            metadata={
-                ENV_RAW_RGB_FRAME_STACK_INFO_KEY: rgb[0][None],
-                "parkour_proprio": state[0],
-                "slot_id": 0,
-            },
+            env_step=env_step,
+            sim_time_ms=env_step * self._frame_ms,
+            metadata=metadata,
         )
 
-    def step(self, action: Action) -> StepResult:
-        goal_index = self._parkour.cur_goal_idx.clone()
-        vla_action = torch.as_tensor(
-            action.value, device=self._env.device, dtype=self._obs.dtype
-        ).reshape(1, PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM)
-        latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
-        predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM:]
-        actor_observation = _actor_observation_with_yaw(self._obs, predicted_yaw)
-        with torch.inference_mode():
-            motor_action = self._actor(
-                actor_observation,
-                hist_encoding=True,
-                scandots_latent=latent,
-            )
-        self._obs, reward, dones, _ = self._env.step(motor_action)
-        successes = self._env.unwrapped.termination_manager.get_term(
-            "parkour_success"
-        )
-        edge = self._edge_term.feet_at_edge.sum(dim=1).float()
-        self._episode_edge_sum += float(edge[0])
-        self._episode_edge_steps += 1
-        self.env_step += 1
-        return StepResult(
-            observation=None,
-            reward=float(reward[0]),
-            done=bool(dones[0]),
-            truncated=False,
-            info={
-                "task_metrics": {
-                    "normalized_waypoint_progress": float(
-                        (goal_index[0] + successes[0].long()).float()
-                        / self._parkour.num_goals
-                    ),
-                    "edge_violation": self._episode_edge_sum
-                    / self._episode_edge_steps,
-                }
-            },
-        )
-
-    def render_game_frame(self):
-        return _rgb_frames(self._env)[0]
-
-    def close(self) -> None:
-        self._env.close()
+    def _raise_if_closed(self) -> None:
+        if self.closed:
+            raise RuntimeError("env step backend is closed")
 
 
-def _run_profile(profile_config: dict, env, actor) -> dict:
+def build_latency_eval_backend(config: dict, env, actor) -> ParkourEnvStepBackend:
+    noop_action = Action(
+        value=np.asarray(config["env"]["noop_action"], dtype=np.float32),
+        name="noop",
+        is_noop=True,
+    )
+    return ParkourEnvStepBackend(env, actor, noop_action=noop_action)
+
+
+def _run_latency_eval(eval_config: dict, env, actor) -> dict:
     from latency_bench.eval.driver import run_from_config
 
-    profile_env = _ParkourProfileEnv(env, actor)
+    backend = build_latency_eval_backend(eval_config, env, actor)
     run_from_config(
-        profile_config,
-        env=profile_env,
-        inference_devices=profile_config["executor"]["inference_devices"],
+        eval_config,
+        env_backend=backend,
+        inference_devices=eval_config["executor"]["inference_devices"],
     )
-    return {"output_dir": profile_config["logging"]["output_dir"]}
+    return {"output_dir": eval_config["logging"]["output_dir"]}
 
 
 def _rgb_frames(env) -> np.ndarray:
@@ -299,7 +426,13 @@ def _rgb_frames(env) -> np.ndarray:
     return background.detach().cpu().numpy()
 
 
-def _policy_observations(rgb: np.ndarray, state: np.ndarray, slots: list[int], step: int):
+def _policy_observations(
+    rgb: np.ndarray,
+    state: np.ndarray,
+    slots: list[int],
+    action_noise_seeds: Sequence[int],
+    step: int,
+):
     from latency_bench.core.types import Observation
     from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
 
@@ -314,6 +447,7 @@ def _policy_observations(rgb: np.ndarray, state: np.ndarray, slots: list[int], s
                 ENV_RAW_RGB_FRAME_STACK_INFO_KEY: rgb[slot][None],
                 "parkour_proprio": state[slot],
                 "slot_id": slot,
+                "action_noise_seed": action_noise_seeds[slot],
             },
         )
         for slot in slots
@@ -327,7 +461,12 @@ def _masked_vla_state(state: np.ndarray) -> np.ndarray:
 
 
 def _predict_vla_outputs(
-    pool, rgb: np.ndarray, state: np.ndarray, slots: list[int], step: int
+    pool,
+    rgb: np.ndarray,
+    state: np.ndarray,
+    slots: list[int],
+    action_noise_seeds: Sequence[int],
+    step: int,
 ) -> np.ndarray:
     state = _masked_vla_state(state)
 
@@ -336,7 +475,13 @@ def _predict_vla_outputs(
         for start in range(0, len(worker_slots), args_cli.inference_batch_size):
             batch_slots = worker_slots[start : start + args_cli.inference_batch_size]
             outputs = worker_pool.predict_batch(
-                _policy_observations(rgb, state, batch_slots, step)
+                _policy_observations(
+                    rgb,
+                    state,
+                    batch_slots,
+                    action_noise_seeds,
+                    step,
+                )
             )
             outputs_by_slot.update(
                 (slot, np.asarray(output.action_chunk, dtype=np.float32))
@@ -401,22 +546,12 @@ def _actor_observation_with_yaw(obs, normalized_yaw):
     return actor_obs
 
 
-def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) -> dict:
-    pool = _new_policy_pool() if use_vla else None
+def _evaluate(env, actor, teacher_policy, *, use_oracle: bool) -> dict:
+    """Evaluate the native teacher or privileged oracle controller."""
     obs, _ = env.get_observations()
     num_envs = env.num_envs
-    all_ids = torch.arange(num_envs, device=env.device)
-    phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
     latent = torch.zeros(
         (num_envs, PARKOUR_VLA_LATENT_DIM), dtype=obs.dtype, device=env.device
-    )
-    predicted_yaw = torch.zeros(
-        (num_envs, PARKOUR_VLA_YAW_DIM), dtype=obs.dtype, device=env.device
-    )
-    action_chunk = torch.zeros(
-        (num_envs, PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM),
-        dtype=obs.dtype,
-        device=env.device,
     )
     returns = torch.zeros(num_envs, dtype=torch.float, device=env.device)
     lengths = torch.zeros(num_envs, dtype=torch.float, device=env.device)
@@ -428,73 +563,50 @@ def _evaluate(env, actor, teacher_policy, *, use_oracle: bool, use_vla: bool) ->
     edge_term = env.unwrapped.reward_manager.get_term_cfg("reward_feet_edge").func
     parkour = env.unwrapped.parkour_manager.get_term("base_parkour")
 
-    try:
-        step = 0
-        while len(episode_returns) < args_cli.eval_episodes:
-            due_ids = (phase == 0).nonzero(as_tuple=False).flatten()
-            with torch.inference_mode():
-                if use_oracle and due_ids.numel():
-                    latent[due_ids] = actor.infer_scandots_latent(obs[due_ids])
-                elif use_vla and due_ids.numel():
-                    slots = due_ids.cpu().tolist()
-                    predicted = _predict_vla_outputs(
-                        pool,
-                        _rgb_frames(env),
-                        obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy(),
-                        slots,
-                        step,
-                    )
-                    action_chunk[due_ids] = torch.from_numpy(predicted).to(env.device)
-
-                if use_vla:
-                    vla_action = action_chunk[all_ids, phase]
-                    latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
-                    predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM :]
-
-                actor_obs = (
-                    _actor_observation_with_yaw(obs, predicted_yaw)
-                    if use_vla
-                    else obs
+    while len(episode_returns) < args_cli.eval_episodes:
+        with torch.inference_mode():
+            if use_oracle:
+                latent = actor.infer_scandots_latent(obs)
+                actions = teacher_policy(
+                    _actor_observation_with_yaw(
+                        obs, torch.zeros(num_envs, 2, device=obs.device)
+                    ),
+                    hist_encoding=True,
+                    scandots_latent=latent,
                 )
-                actions = (
-                    teacher_policy(actor_obs, hist_encoding=True, scandots_latent=latent)
-                    if use_oracle or use_vla
-                    else teacher_policy(actor_obs, hist_encoding=True)
-                )
+            else:
+                actions = teacher_policy(obs, hist_encoding=True)
 
-            goal_index = parkour.cur_goal_idx.clone()
-            obs, rewards, dones, _ = env.step(actions)
-            successes = env.unwrapped.termination_manager.get_term(
-                "parkour_success"
+        goal_index = parkour.cur_goal_idx.clone()
+        obs, rewards, dones, _ = env.step(actions)
+        successes = env.unwrapped.termination_manager.get_term("parkour_success")
+        edge = edge_term.feet_at_edge.sum(dim=1).float()
+        for slot, value in enumerate(edge.cpu().numpy().tolist()):
+            episode_edges[slot].append(value)
+        returns += rewards
+        lengths += 1
+
+        done_ids = dones.bool().nonzero(as_tuple=False).flatten()
+        if done_ids.numel():
+            remaining = args_cli.eval_episodes - len(episode_returns)
+            accepted_ids = done_ids[:remaining]
+            episode_returns.extend(returns[accepted_ids].cpu().numpy().tolist())
+            episode_lengths.extend(lengths[accepted_ids].cpu().numpy().tolist())
+            progress.extend(
+                (
+                    (goal_index[accepted_ids] + successes[accepted_ids].long()).float()
+                    / parkour.num_goals
+                )
+                .cpu()
+                .numpy()
+                .tolist()
             )
-            edge = edge_term.feet_at_edge.sum(dim=1).float()
-            for slot, value in enumerate(edge.cpu().numpy().tolist()):
-                episode_edges[slot].append(value)
-            returns += rewards
-            lengths += 1
-            phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
-
-            done_ids = dones.bool().nonzero(as_tuple=False).flatten()
-            if done_ids.numel():
-                remaining = args_cli.eval_episodes - len(episode_returns)
-                accepted_ids = done_ids[:remaining]
-                episode_returns.extend(returns[accepted_ids].cpu().numpy().tolist())
-                episode_lengths.extend(lengths[accepted_ids].cpu().numpy().tolist())
-                episode_progress = (
-                    goal_index[accepted_ids] + successes[accepted_ids].long()
-                ).float() / parkour.num_goals
-                progress.extend(episode_progress.cpu().numpy().tolist())
-                for slot in accepted_ids.cpu().tolist():
-                    edge_violations.extend(episode_edges[slot])
-                returns[done_ids] = 0
-                lengths[done_ids] = 0
-                phase[done_ids] = 0
-                for slot in done_ids.cpu().tolist():
-                    episode_edges[slot].clear()
-            step += 1
-    finally:
-        if pool is not None:
-            _close_policy_pool(pool)
+            for slot in accepted_ids.cpu().tolist():
+                edge_violations.extend(episode_edges[slot])
+            returns[done_ids] = 0
+            lengths[done_ids] = 0
+            for slot in done_ids.cpu().tolist():
+                episode_edges[slot].clear()
 
     return {
         "episodes": len(episode_returns),
@@ -742,14 +854,19 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
         dtype=obs.dtype,
         device=env.device,
     )
+    all_slots = list(range(num_envs))
     episode_rows: list[list[dict]] = [[] for _ in range(num_envs)]
+    episode_counts = [0] * num_envs
+    action_noise_seeds = [
+        derive_seed(args_cli.seed, vector_index=slot, episode_idx=0)
+        for slot in all_slots
+    ]
     active_rows: list[dict | None] = [None] * num_envs
     started_rows = row_count
     completed_rows = row_count
     control_step = 0
     mts_prediction_count = 0
     mts_total_count = 0
-    all_slots = list(range(num_envs))
 
     def flush_slot(slot: int) -> None:
         nonlocal row_count, shard_index
@@ -775,6 +892,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
                         rgb,
                         state_cpu,
                         due_slots,
+                        action_noise_seeds,
                         control_step,
                     )
                     action_chunk[due_ids] = torch.from_numpy(predicted).to(env.device)
@@ -824,6 +942,13 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
             phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
             phase[dones.bool()] = 0
             control_step += 1
+            for slot in np.flatnonzero(dones_cpu).tolist():
+                episode_counts[slot] += 1
+                action_noise_seeds[slot] = derive_seed(
+                    args_cli.seed,
+                    vector_index=slot,
+                    episode_idx=episode_counts[slot],
+                )
 
             for slot, row in enumerate(active_rows):
                 if row is None:
@@ -903,17 +1028,14 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
 def main() -> None:
     from latency_bench.core.config import load_config
 
-    profile_config = None
-    if args_cli.mode == "profile":
-        profile_config = load_config(args_cli.profile_config)
-        args_cli.policy_config = args_cli.profile_config
-        args_cli.checkpoint = profile_config["env"]["runtime_checkpoint_path"]
-        args_cli.num_envs = 1
-        args_cli.eval_episodes = profile_config["evaluation"]["eval_episodes"]
-        args_cli.max_episode_steps = profile_config["evaluation"]["eval_max_steps"]
-        args_cli.seed = profile_config["experiment"]["seed"]
-        args_cli.device = profile_config["env"]["simulator_device"]
-
+    if args_cli.mode == "latency-eval":
+        args_cli.eval_config = load_config(args_cli.eval_config)
+        args_cli.checkpoint = args_cli.eval_config["env"]["runtime_checkpoint_path"]
+        args_cli.num_envs = args_cli.eval_config["evaluation"]["eval_parallel_envs"]
+        args_cli.eval_episodes = args_cli.eval_config["evaluation"]["eval_episodes"]
+        args_cli.max_episode_steps = args_cli.eval_config["evaluation"]["eval_max_steps"]
+        args_cli.seed = args_cli.eval_config["experiment"]["seed"]
+        args_cli.device = args_cli.eval_config["env"]["simulator_device"]
     env, actor, teacher_policy, checkpoint = _load_environment_and_teacher()
     try:
         if args_cli.startup_ready_file is not None:
@@ -922,15 +1044,14 @@ def main() -> None:
             result = _collect(env, actor, teacher_policy, checkpoint)
         elif args_cli.mode == "dagger-collect":
             result = _collect_dagger(env, actor, teacher_policy, checkpoint)
-        elif args_cli.mode == "profile":
-            result = _run_profile(profile_config, env, actor)
+        elif args_cli.mode == "latency-eval":
+            result = _run_latency_eval(args_cli.eval_config, env, actor)
         else:
             result = _evaluate(
                 env,
                 actor,
                 teacher_policy,
                 use_oracle=args_cli.mode == "oracle-eval",
-                use_vla=args_cli.mode == "vla-eval",
             )
             result.update(
                 {

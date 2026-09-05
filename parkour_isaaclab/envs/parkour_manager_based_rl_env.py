@@ -93,6 +93,19 @@ class ParkourManagerBasedRLEnv(ParkourManagerBasedEnv, gym.Env):
         return math.ceil(self.max_episode_length_s / self.step_dt)
     
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        """Advance the environment and reset slots that terminated.
+
+        This is the native Isaac Lab contract used by training and the
+        teacher/collector consumers.  LatencyBench uses :meth:`step_no_reset`
+        so that its episode scheduler owns partial resets.
+        """
+        return self._step(action, reset_done=True)
+
+    def step_no_reset(self, action: torch.Tensor) -> VecEnvStepReturn:
+        """Advance one vector step without resetting terminated slots."""
+        return self._step(action, reset_done=False)
+
+    def _step(self, action: torch.Tensor, *, reset_done: bool) -> VecEnvStepReturn:
         # process actions
         self.action_manager.process_action(action.to(self.device))
         self.recorder_manager.record_pre_step()
@@ -135,7 +148,7 @@ class ParkourManagerBasedRLEnv(ParkourManagerBasedEnv, gym.Env):
 
         # -- reset envs that terminated/timed-out and log the episode information
         
-        if len(reset_env_ids) > 0:
+        if reset_done and len(reset_env_ids) > 0:
             # trigger recorder terms for pre-reset calls
             self.recorder_manager.record_pre_reset(reset_env_ids)
 

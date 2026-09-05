@@ -70,7 +70,6 @@ def test_eval_collects_exact_episode_budget_across_resets():
         actor=None,
         teacher_policy=lambda obs, **kwargs: torch.zeros((len(obs), 12)),
         use_oracle=False,
-        use_vla=False,
     )
 
     assert result["episodes"] == 100
@@ -78,155 +77,6 @@ def test_eval_collects_exact_episode_budget_across_resets():
     assert result["episode_length"]["mean"] <= 3
     assert result["normalized_waypoint_progress"]["mean"] == 1.0
     assert result["edge_violation"]["mean"] == 0.0
-
-
-def test_profile_env_maps_latent_and_yaw_through_fixed_actor():
-    module = _load_parkour_vla_module()
-    module.PARKOUR_VLA_LATENT_DIM = 32
-    module.PARKOUR_VLA_YAW_DIM = 2
-    module.PARKOUR_VLA_PROPRIO_DIM = 53
-    module.GO2_PARKOUR_YAW_SCALE = 1.5
-    seen = []
-
-    class Env:
-        device = torch.device("cpu")
-
-        def __init__(self):
-            self.step_count = 0
-            self.edge = SimpleNamespace(
-                feet_at_edge=torch.zeros((1, 4), dtype=torch.bool)
-            )
-            self.parkour = SimpleNamespace(
-                cur_goal_idx=torch.tensor([1]), num_goals=4
-            )
-            self.success = torch.tensor([False])
-            self.unwrapped = SimpleNamespace(
-                reward_manager=SimpleNamespace(
-                    get_term_cfg=lambda _name: SimpleNamespace(func=self.edge)
-                ),
-                parkour_manager=SimpleNamespace(
-                    get_term=lambda _name: self.parkour
-                ),
-                termination_manager=SimpleNamespace(
-                    get_term=lambda _name: self.success
-                ),
-            )
-
-        def reset(self):
-            self.step_count = 0
-            self.parkour.cur_goal_idx = torch.tensor([1])
-            self.success = torch.tensor([False])
-            self.edge.feet_at_edge = torch.zeros((1, 4), dtype=torch.bool)
-            return torch.zeros(1, 53), {}
-
-        def step(self, action):
-            seen.append(action)
-            self.step_count += 1
-            self.edge.feet_at_edge = torch.tensor(
-                [[True, True, self.step_count > 1, self.step_count > 1]]
-            )
-            self.success = torch.tensor([self.step_count == 1])
-            return (
-                torch.zeros(1, 53),
-                torch.tensor([2.0]),
-                torch.tensor([self.step_count == 1]),
-                {},
-            )
-
-    class Actor:
-        def __call__(self, actor_obs, **kwargs):
-            seen.append((actor_obs, kwargs))
-            return torch.zeros(1, 12)
-
-    env = Env()
-    adapter = module._ParkourProfileEnv(env, Actor())
-    adapter._obs = torch.zeros(1, 53)
-    result = adapter.step(
-        module.Action(value=np.arange(34, dtype=np.float32))
-    )
-
-    assert result.done
-    assert result.reward == 2.0
-    assert result.info["task_metrics"] == {
-        "normalized_waypoint_progress": 0.5,
-        "edge_violation": 2.0,
-    }
-    actor_obs, kwargs = seen[0]
-    np.testing.assert_array_equal(kwargs["scandots_latent"].numpy(), np.arange(32)[None])
-    np.testing.assert_array_equal(actor_obs[0, 6:8].numpy(), np.arange(32, 34) * 1.5)
-    assert seen[1].shape == (1, 12)
-
-    env.success = torch.tensor([False])
-    env.edge.feet_at_edge = torch.tensor([[True, True, True, True]])
-    result = adapter.step(module.Action(value=np.zeros(34, dtype=np.float32)))
-    assert result.info["task_metrics"]["normalized_waypoint_progress"] == 0.25
-    assert result.info["task_metrics"]["edge_violation"] == 3.0
-
-    module._rgb_frames = lambda _env: np.zeros((1, 1, 1, 3), dtype=np.uint8)
-    adapter.reset()
-    assert adapter._episode_edge_sum == 0.0
-    assert adapter._episode_edge_steps == 0
-
-
-def test_vla_eval_refreshes_reset_slots_and_truncates_final_vector_step():
-    module = _load_parkour_vla_module()
-    module.GO2_PARKOUR_YAW_SCALE = 1.5
-    module.PARKOUR_VLA_PROPRIO_DIM = 53
-    calls = []
-    pool = SimpleNamespace(close=lambda: None)
-    module._new_policy_pool = lambda: [pool]
-    module._rgb_frames = lambda env: np.zeros((env.num_envs, 1, 1, 3))
-
-    def predict(pool, rgb, state, slots, step):
-        calls.append((step, slots))
-        return np.zeros((len(slots), 40, 34), dtype=np.float32)
-
-    module._predict_vla_outputs = predict
-
-    result = module._evaluate(
-        _FakeEnv(limits=(1, 1, 1)),
-        actor=None,
-        teacher_policy=lambda obs, **kwargs: torch.zeros((len(obs), 12)),
-        use_oracle=False,
-        use_vla=True,
-    )
-
-    assert result["episodes"] == 100
-    assert len(calls) == 34
-    assert all(slots == [0, 1, 2] for _, slots in calls)
-
-
-def test_vla_eval_executes_five_chunk_entries_before_replanning():
-    module = _load_parkour_vla_module()
-    module.args_cli.eval_episodes = 1
-    module.GO2_PARKOUR_YAW_SCALE = 1.5
-    module.PARKOUR_VLA_PROPRIO_DIM = 53
-    module._new_policy_pool = lambda: [SimpleNamespace(close=lambda: None)]
-    module._rgb_frames = lambda env: np.zeros((env.num_envs, 1, 1, 3))
-    calls = []
-    executed = []
-
-    def predict(pool, rgb, state, slots, step):
-        calls.append((step, slots))
-        chunk = np.zeros((len(slots), 40, 34), dtype=np.float32)
-        chunk[:, :, 0] = np.arange(40)
-        return chunk
-
-    def policy(obs, *, scandots_latent, **kwargs):
-        executed.append(float(scandots_latent[0, 0]))
-        return torch.zeros((len(obs), 12))
-
-    module._predict_vla_outputs = predict
-    module._evaluate(
-        _FakeEnv(limits=(6, 100, 100)),
-        actor=None,
-        teacher_policy=policy,
-        use_oracle=False,
-        use_vla=True,
-    )
-
-    assert executed == [0.0, 1.0, 2.0, 3.0, 4.0, 0.0]
-    assert calls == [(0, [0, 1, 2]), (5, [0, 1, 2])]
 
 
 def test_bootstrap_refreshes_camera_once_per_five_control_steps(tmp_path):
@@ -389,6 +239,9 @@ def test_multi_pool_prediction_keeps_slot_affinity_and_request_order():
         def predict_batch(self, observations):
             slots = [item.metadata["slot_id"] for item in observations]
             assert all(slot % 2 == self.worker_id for slot in slots)
+            assert [item.metadata["action_noise_seed"] for item in observations] == [
+                100 + slot for slot in slots
+            ]
             self.slots.extend(slots)
             if self.worker_id == 0:
                 time.sleep(0.01)
@@ -403,14 +256,88 @@ def test_multi_pool_prediction_keeps_slot_affinity_and_request_order():
     rgb = np.zeros((8, 1, 1, 3), dtype=np.uint8)
     state = np.zeros((8, 53), dtype=np.float32)
 
-    output = module._predict_vla_outputs(pools, rgb, state, [7, 2, 5, 0], 10)
-    reset_output = module._predict_vla_outputs(pools, rgb, state, [2, 7], 11)
+    episode_seeds = list(range(100, 108))
+    output = module._predict_vla_outputs(
+        pools, rgb, state, [7, 2, 5, 0], episode_seeds, 10
+    )
+    reset_output = module._predict_vla_outputs(
+        pools, rgb, state, [2, 7], episode_seeds, 11
+    )
 
     assert output.shape == (4, 40, 34)
     np.testing.assert_array_equal(output[:, 0, 0], [7, 2, 5, 0])
     np.testing.assert_array_equal(reset_output[:, 0, 0], [2, 7])
     assert pools[0].slots == [2, 0, 2]
     assert pools[1].slots == [7, 5, 7]
+
+
+def test_latency_backend_uses_no_reset_step_and_preserves_edge_moments():
+    module = _load_parkour_vla_module()
+    module.PARKOUR_VLA_PROPRIO_DIM = 53
+    module.GO2_PARKOUR_YAW_SCALE = 1.5
+    module._rgb_frames = lambda _env: np.zeros((2, 1, 1, 3), dtype=np.uint8)
+
+    class Edge:
+        feet_at_edge = torch.tensor([[True, False], [False, True]])
+
+    class RawEnv:
+        step_dt = 0.02
+        device = torch.device("cpu")
+        episode_length_buf = torch.zeros(2, dtype=torch.long)
+        reward_manager = SimpleNamespace(
+            get_term_cfg=lambda _name: SimpleNamespace(func=Edge())
+        )
+        parkour_manager = SimpleNamespace(
+            get_term=lambda _name: SimpleNamespace(
+                cur_goal_idx=torch.zeros(2, dtype=torch.long), num_goals=4
+            )
+        )
+        termination_manager = SimpleNamespace(
+            get_term=lambda _name: torch.tensor([False, True])
+        )
+        action_manager = SimpleNamespace(total_action_dim=12)
+
+        def reset(self, *, seed, env_ids):
+            self.episode_length_buf[env_ids] = 0
+            return {"policy": torch.zeros(2, 753)}, {}
+
+        def step_no_reset(self, _action):
+            self.episode_length_buf += 1
+            return (
+                {"policy": torch.zeros(2, 753)},
+                torch.ones(2),
+                torch.tensor([False, True]),
+                torch.tensor([False, False]),
+                {},
+            )
+
+    raw = RawEnv()
+    env = SimpleNamespace(
+        num_envs=2,
+        unwrapped=raw,
+        device=torch.device("cpu"),
+        get_observations=lambda: (torch.zeros(2, 753), {}),
+        close=lambda: None,
+    )
+    actor = lambda obs, **_kwargs: torch.zeros((len(obs), 12))
+    backend = module.ParkourEnvStepBackend(
+        env,
+        actor,
+        noop_action=module.Action(value=np.zeros(34, dtype=np.float32)),
+    )
+
+    backend.reset_slot(0, episode_id=0, seed=2)
+    response = backend.step_slots(
+        {0: module.Action(value=np.zeros(34, dtype=np.float32))}
+    )[0].result
+
+    assert response.done is False
+    assert raw.episode_length_buf.tolist() == [1, 1]
+    assert response.info["task_metric_moments"]["edge_violation"] == {
+        "sum": 1.0,
+        "sum_sq": 1.0,
+        "count": 1,
+    }
 
 
 def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_path):
@@ -420,6 +347,7 @@ def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_pat
     module.args_cli.dagger_shard_rows = 1000
     module.args_cli.dagger_round = 0
     module.args_cli.inference_batch_size = 8
+    module.args_cli.seed = 1
     module.GO2_PARKOUR_YAW_SCALE = 1.5
     module.GO2_PARKOUR_MTS_THRESHOLD_RAD = 0.6
     module.PARKOUR_VLA_ACTION_DIM = 34
@@ -437,7 +365,7 @@ def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_pat
         lambda output, index, rows, **kwargs: written.append(rows)
     )
 
-    def predict(pool, rgb, state, slots, step):
+    def predict(pool, rgb, state, slots, episode_seeds, step):
         chunk = np.zeros((len(slots), 40, 34), dtype=np.float32)
         chunk[:, :, 0] = np.arange(40)
         return chunk
