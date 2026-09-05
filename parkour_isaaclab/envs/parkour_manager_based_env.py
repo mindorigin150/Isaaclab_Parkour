@@ -30,6 +30,7 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         self.cfg = cfg
         # initialize internal variables
         self._is_closed = False
+        self._latency_eval_active_mask: torch.Tensor | None = None
         self._latency_eval_seeds: dict[int, int] = {}
         self._latency_eval_generators: dict[tuple[str, int], torch.Generator] = {}
 
@@ -86,7 +87,7 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         # viewport is not available in other rendering modes so the function will throw a warning
         # FIXME: This needs to be fixed in the future when we unify the UI functionalities even for
         # non-rendering modes.
-        if self.sim.render_mode >= self.sim.RenderMode.PARTIAL_RENDERING:
+        if self.sim.has_gui():
             self.viewport_camera_controller = ParkourViewportCameraController(self, self.cfg.viewer)
         else:
             self.viewport_camera_controller = None
@@ -155,14 +156,18 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
     def reset(
         self, seed: int | None = None, env_ids: Sequence[int] | None = None, options: dict[str, Any] | None = None
     ) -> tuple[VecEnvObs, dict]:
+        reset_all = env_ids is None
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
+        reset_active_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        reset_active_mask[env_ids] = True
         # trigger recorder terms for pre-reset calls
         self.recorder_manager.record_pre_reset(env_ids)
 
         # set the seed
         if seed is not None:
-            self.seed(seed)
+            if reset_all:
+                self.seed(seed)
             self.set_latency_eval_seed(env_ids, seed)
 
         # reset state of scene
@@ -179,7 +184,11 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         self.recorder_manager.record_post_reset(env_ids)
 
         # compute observations
-        self.obs_buf = self.observation_manager.compute()
+        self._latency_eval_active_mask = reset_active_mask
+        try:
+            self.obs_buf = self.observation_manager.compute()
+        finally:
+            self._latency_eval_active_mask = None
 
         if self.cfg.wait_for_textures and self.sim.has_rtx_sensors():
             while SimulationManager.assets_loading():
@@ -210,10 +219,17 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         high: float | torch.Tensor,
         shape: Sequence[int],
         device: str | torch.device,
-        env_ids: Sequence[int],
+        env_ids: Sequence[int] | None,
     ) -> torch.Tensor:
         if not self._latency_eval_seeds:
             return math_utils.sample_uniform(low, high, shape, device=device)
+        if env_ids is None:
+            active_mask = self._latency_eval_active_mask
+            env_ids = (
+                active_mask.nonzero(as_tuple=False).squeeze(-1)
+                if active_mask is not None
+                else torch.arange(self.num_envs, device=device)
+            )
         shape = tuple(int(value) for value in shape)
         rows = []
         low = torch.as_tensor(low, device=device)
@@ -232,10 +248,17 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         high: int,
         shape: Sequence[int],
         device: str | torch.device,
-        env_ids: Sequence[int],
+        env_ids: Sequence[int] | None,
     ) -> torch.Tensor:
         if not self._latency_eval_seeds:
             return torch.randint(high, shape, device=device)
+        if env_ids is None:
+            active_mask = self._latency_eval_active_mask
+            env_ids = (
+                active_mask.nonzero(as_tuple=False).squeeze(-1)
+                if active_mask is not None
+                else torch.arange(self.num_envs, device=device)
+            )
         shape = tuple(int(value) for value in shape)
         return torch.stack(
             [

@@ -21,6 +21,12 @@ from .distillation_with_extractor import DistillationWithExtractor
 from copy import copy 
 import warnings 
 
+from training.common.checkpoints import (
+    atomic_torch_save,
+    capture_rng_state,
+    restore_rng_state,
+)
+
 class OnPolicyRunnerWithExtractor(OnPolicyRunner):
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
@@ -223,6 +229,18 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                         )
                     else:
                         privileged_obs = obs
+
+                    if "terminal_observations" in infos and self.empirical_normalization:
+                        terminal_observations = infos["terminal_observations"]
+                        terminal_key = self.privileged_obs_type or "policy"
+                        terminal_normalizer = (
+                            self.privileged_obs_normalizer
+                            if self.privileged_obs_type is not None
+                            else self.obs_normalizer
+                        )
+                        terminal_observations[terminal_key] = terminal_normalizer(
+                            terminal_observations[terminal_key].to(self.device)
+                        )
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -521,6 +539,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
 
     def save(self, path: str, infos=None):
         # -- Save model
+        latency_checkpoint = hasattr(self.env, "latency_state_dict")
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             'estimator_state_dict': self.alg.estimator.state_dict(),
@@ -538,6 +557,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        if latency_checkpoint:
+            saved_dict["latency_state_dict"] = self.env.latency_state_dict()
+            saved_dict["rng_state"] = capture_rng_state()
         # -- Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
@@ -546,7 +568,10 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             saved_dict['depth_encoder_state_dict'] = self.alg.depth_encoder.state_dict()
             saved_dict['depth_actor_state_dict'] = self.alg.depth_actor.state_dict()
         # save model
-        torch.save(saved_dict, path)
+        if latency_checkpoint:
+            atomic_torch_save(saved_dict, path)
+        else:
+            torch.save(saved_dict, path)
 
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
@@ -565,6 +590,8 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             loading_teacher = not all(present_depth_keys)
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        if "latency_state_dict" in loaded_dict and hasattr(self.env, "load_latency_state_dict"):
+            self.env.load_latency_state_dict(loaded_dict["latency_state_dict"])
         if self.empirical_normalization:
             if loading_teacher:
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
@@ -593,7 +620,15 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 self.alg.learning_rate = self.alg.depth_actor_optimizer.param_groups[0]["lr"]
             if self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-            self.current_learning_iteration = loaded_dict["iter"]
+            if "latency_state_dict" in loaded_dict:
+                # Latency bundles store the last completed update; resume
+                # consumes the following update instead of replaying it.
+                self.current_learning_iteration = loaded_dict["iter"] + 1
+            else:
+                # Native checkpoints retain the original zero-based semantics.
+                self.current_learning_iteration = loaded_dict["iter"]
+        if load_optimizer and "latency_state_dict" in loaded_dict:
+            restore_rng_state(loaded_dict["rng_state"])
         return loaded_dict["infos"]
 
     def get_estimator_inference_policy(self, device=None):

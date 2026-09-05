@@ -9,6 +9,7 @@
 import os 
 import argparse
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -28,6 +29,10 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
+parser.add_argument("--latency-config", type=Path, default=None)
+parser.add_argument("--latency-teacher-checkpoint", type=Path, default=None)
+parser.add_argument("--latency-action-horizon", type=int, default=40)
+parser.add_argument("--latency-control-repeat", type=int, default=5)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -87,6 +92,9 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_pickle, dump_yaml
 from parkour_tasks.extreme_parkour_task.config.go2.agents.parkour_rl_cfg import ParkourRslRlOnPolicyRunnerCfg
 from scripts.rsl_rl.vecenv_wrapper import ParkourRslRlVecEnvWrapper
+if str(Path(__file__).resolve().parents[4]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from scripts.rsl_rl.latency_vecenv import ParkourLatencyRslRlVecEnvWrapper
 # import isaaclab_tasks  # noqa: F401
 import parkour_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -165,10 +173,45 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # wrap around environment for rsl-rl
-    env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    # # create runner from rsl-rl
+    if args_cli.latency_config is not None:
+        if args_cli.latency_teacher_checkpoint is None:
+            raise ValueError("--latency-teacher-checkpoint is required with --latency-config")
+        teacher_env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        teacher_runner = OnPolicyRunnerWithExtractor(
+            teacher_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
+        )
+        teacher_runner.load(str(args_cli.latency_teacher_checkpoint), load_optimizer=False)
+        decoder = teacher_runner.alg.policy.actor
+
+        from latency_bench.core.config import load_config
+
+        latency_config = load_config(args_cli.latency_config)
+        env = ParkourLatencyRslRlVecEnvWrapper(
+            env,
+            decoder,
+            latency_config,
+            action_horizon=args_cli.latency_action_horizon,
+            control_repeat=args_cli.latency_control_repeat,
+            gamma=agent_cfg.algorithm.gamma,
+            clip_actions=agent_cfg.clip_actions,
+        )
+        agent_cfg.policy.actor.class_name = "CommandActor"
+        agent_cfg.policy.actor.action_horizon = args_cli.latency_action_horizon
+        agent_cfg.policy.actor.command_dim = 34
+    else:
+        env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+    # create runner from the native RSL-RL implementation
     runner = OnPolicyRunnerWithExtractor(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    if args_cli.latency_config is not None:
+        teacher_state = teacher_runner.alg.policy.actor.state_dict()
+        command_actor = runner.alg.policy.actor
+        own_state = command_actor.state_dict()
+        output_head = f"actor_backbone.{len(command_actor.actor_backbone) - 1}."
+        for name, value in teacher_state.items():
+            if not name.startswith(output_head):
+                own_state[name].copy_(value)
+        command_actor.load_state_dict(own_state)
     # # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
@@ -185,6 +228,10 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
 
     # # # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    print(
+        f"NATIVE_CHECKPOINT={os.path.join(log_dir, f'model_{runner.current_learning_iteration}.pt')}",
+        flush=True,
+    )
 
     # close the simulator
     env.close()

@@ -7,6 +7,131 @@ import torch.optim as optim
 
 from .actor_critic_with_encoder import ActorCriticRMA
 from rsl_rl.algorithms import PPO
+from rsl_rl.storage.rollout_storage import RolloutStorage, split_and_pad_trajectories
+
+
+class AdmissionRolloutStorage(RolloutStorage):
+    """Rollout storage that keeps the command transport admission mask."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.admission = torch.ones(
+            self.num_transitions_per_env,
+            self.num_envs,
+            1,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+    def mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(
+            num_mini_batches * mini_batch_size,
+            requires_grad=False,
+            device=self.device,
+        )
+        observations = self.observations.flatten(0, 1)
+        privileged_observations = (
+            self.privileged_observations.flatten(0, 1)
+            if self.privileged_observations is not None
+            else observations
+        )
+        actions = self.actions.flatten(0, 1)
+        values = self.values.flatten(0, 1)
+        returns = self.returns.flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        advantages = self.advantages.flatten(0, 1)
+        old_mu = self.mu.flatten(0, 1)
+        old_sigma = self.sigma.flatten(0, 1)
+        admission = self.admission.flatten(0, 1)
+        rnd_state = (
+            self.rnd_state.flatten(0, 1)
+            if self.rnd_state_shape is not None
+            else None
+        )
+        for _ in range(num_epochs):
+            for index in range(num_mini_batches):
+                batch_idx = indices[index * mini_batch_size : (index + 1) * mini_batch_size]
+                yield (
+                    observations[batch_idx],
+                    privileged_observations[batch_idx],
+                    actions[batch_idx],
+                    values[batch_idx],
+                    advantages[batch_idx],
+                    returns[batch_idx],
+                    old_actions_log_prob[batch_idx],
+                    old_mu[batch_idx],
+                    old_sigma[batch_idx],
+                    (None, None),
+                    None,
+                    rnd_state[batch_idx] if rnd_state is not None else None,
+                    admission[batch_idx],
+                )
+
+    def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        padded_obs, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        padded_privileged_obs = (
+            split_and_pad_trajectories(self.privileged_observations, self.dones)[0]
+            if self.privileged_observations is not None
+            else padded_obs
+        )
+        padded_rnd_state = (
+            split_and_pad_trajectories(self.rnd_state, self.dones)[0]
+            if self.rnd_state_shape is not None
+            else None
+        )
+        mini_batch_size = self.num_envs // num_mini_batches
+        for _ in range(num_epochs):
+            first_traj = 0
+            for index in range(num_mini_batches):
+                start = index * mini_batch_size
+                stop = (index + 1) * mini_batch_size
+                dones = self.dones.squeeze(-1)
+                last_was_done = torch.zeros_like(dones, dtype=torch.bool)
+                last_was_done[1:] = dones[:-1]
+                last_was_done[0] = True
+                trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
+                last_traj = first_traj + trajectories_batch_size
+                masks_batch = trajectory_masks[:, first_traj:last_traj]
+                obs_batch = padded_obs[:, first_traj:last_traj]
+                privileged_obs_batch = padded_privileged_obs[:, first_traj:last_traj]
+                rnd_state_batch = (
+                    padded_rnd_state[:, first_traj:last_traj]
+                    if padded_rnd_state is not None
+                    else None
+                )
+                last_was_done = last_was_done.permute(1, 0)
+                hid_a_batch = [
+                    saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                    .transpose(1, 0)
+                    .contiguous()
+                    for saved_hidden_states in self.saved_hidden_states_a
+                ]
+                hid_c_batch = [
+                    saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                    .transpose(1, 0)
+                    .contiguous()
+                    for saved_hidden_states in self.saved_hidden_states_c
+                ]
+                hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
+                hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
+                yield (
+                    obs_batch,
+                    privileged_obs_batch,
+                    self.actions[:, start:stop],
+                    self.values[:, start:stop],
+                    self.advantages[:, start:stop],
+                    self.returns[:, start:stop],
+                    self.actions_log_prob[:, start:stop],
+                    self.mu[:, start:stop],
+                    self.sigma[:, start:stop],
+                    (hid_a_batch, hid_c_batch),
+                    masks_batch,
+                    rnd_state_batch,
+                    self.admission[:, start:stop],
+                )
+                first_traj = last_traj
 
 class PPOWithExtractor(PPO):
     policy: ActorCriticRMA
@@ -74,6 +199,27 @@ class PPOWithExtractor(PPO):
         self.priv_reg_coef_schedual = priv_reg_coef_schedual
         self.counter = 0
 
+    def init_storage(
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        actor_obs_shape,
+        critic_obs_shape,
+        actions_shape,
+    ):
+        rnd_state_shape = [self.rnd.num_states] if self.rnd else None
+        self.storage = AdmissionRolloutStorage(
+            training_type,
+            num_envs,
+            num_transitions_per_env,
+            actor_obs_shape,
+            critic_obs_shape,
+            actions_shape,
+            rnd_state_shape,
+            self.device,
+        )
+
     def broadcast_parameters(self):
         super().broadcast_parameters()
         estimator_params = [self.estimator.state_dict()]
@@ -115,7 +261,71 @@ class PPOWithExtractor(PPO):
         self.transition.privileged_observations = critic_obs
 
         return self.transition.actions
-    
+
+    def process_env_step(self, rewards, dones, infos):
+        if "latency_discount" not in infos:
+            return super().process_env_step(rewards, dones, infos)
+
+        self.transition.rewards = rewards.clone()
+        self.transition.dones = dones
+        if self.rnd:
+            rnd_state = infos["observations"]["rnd_state"]
+            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            self.transition.rewards += self.intrinsic_rewards
+            self.transition.rnd_state = rnd_state.clone()
+
+        discount = infos["latency_discount"].to(self.device).reshape(-1, 1)
+        if "time_outs" in infos and infos["time_outs"].any():
+            terminal_observations = infos["terminal_observations"]
+            critic_key = "critic" if "critic" in terminal_observations else "policy"
+            terminal_values = self.policy.evaluate(
+                terminal_observations[critic_key].to(self.device)
+            ).detach()
+            timeout = infos["time_outs"].to(self.device).reshape(-1, 1)
+            bootstrap = discount * timeout * terminal_values
+            self.transition.rewards += bootstrap.reshape_as(self.transition.rewards)
+
+        self.storage.admission[self.storage.step].copy_(
+            infos["latency_admission"].to(self.device).reshape(-1, 1)
+        )
+
+        if not hasattr(self, "_latency_discounts"):
+            self._latency_discounts = torch.ones_like(
+                self.storage.dones, dtype=torch.float32, device=self.device
+            )
+        self._latency_discounts[self.storage.step].copy_(discount)
+        self.storage.add_transitions(self.transition)
+        self.transition.clear()
+        self.policy.reset(dones)
+
+    def compute_returns(self, last_critic_obs):
+        if not hasattr(self, "_latency_discounts"):
+            return super().compute_returns(last_critic_obs)
+
+        last_values = self.policy.evaluate(last_critic_obs).detach()
+        advantage = 0
+        for step in reversed(range(self.storage.num_transitions_per_env)):
+            next_values = last_values if step == self.storage.num_transitions_per_env - 1 else self.storage.values[step + 1]
+            next_is_not_terminal = 1.0 - self.storage.dones[step].float()
+            discount = self._latency_discounts[step]
+            delta = self.storage.rewards[step] + next_is_not_terminal * discount * next_values - self.storage.values[step]
+            advantage = delta + next_is_not_terminal * discount * self.lam * advantage
+            self.storage.returns[step] = advantage + self.storage.values[step]
+
+        self.storage.advantages = self.storage.returns - self.storage.values
+        if not self.normalize_advantage_per_mini_batch:
+            admitted = self.storage.admission
+            admitted_advantages = self.storage.advantages[admitted]
+            if admitted_advantages.numel():
+                self.storage.advantages = torch.where(
+                    admitted,
+                    (self.storage.advantages - admitted_advantages.mean())
+                    / (admitted_advantages.std(unbiased=False) + 1e-8),
+                    torch.zeros_like(self.storage.advantages),
+                )
+            else:
+                self.storage.advantages.zero_()
+
 
     def update(self):  # noqa: C901
         mean_value_loss = 0
@@ -123,6 +333,7 @@ class PPOWithExtractor(PPO):
         mean_priv_reg_loss = 0
         mean_entropy = 0
         mean_estimator_loss = 0
+        mean_admitted_count = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -154,6 +365,7 @@ class PPOWithExtractor(PPO):
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            admission_batch,
         ) in generator:
 
             # number of augmentations per sample
@@ -165,7 +377,19 @@ class PPOWithExtractor(PPO):
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    admitted = admission_batch
+                    if admitted.any():
+                        admitted_advantages = advantages_batch[admitted]
+                        normalized_advantages = (
+                            advantages_batch - admitted_advantages.mean()
+                        ) / (admitted_advantages.std(unbiased=False) + 1e-8)
+                        advantages_batch = torch.where(
+                            admitted,
+                            normalized_advantages,
+                            torch.zeros_like(advantages_batch),
+                        )
+                    else:
+                        advantages_batch.zero_()
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -187,6 +411,7 @@ class PPOWithExtractor(PPO):
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
+                admission_batch = admission_batch.repeat(num_aug, 1)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
@@ -254,12 +479,25 @@ class PPOWithExtractor(PPO):
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            log_ratio = actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
+            # ponytail: bound H40 joint ratios for float32 gradients; revisit the loss if saturation is common.
+            ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            admitted_batch = admission_batch.squeeze(-1)
+            surrogate_values = torch.max(surrogate, surrogate_clipped)
+            if admitted_batch.any():
+                surrogate_loss = surrogate_values[admitted_batch].mean()
+            else:
+                surrogate_loss = surrogate_values.sum() * 0.0
+
+            admitted_entropy = admission_batch[:original_batch_size].squeeze(-1)
+            if admitted_entropy.any():
+                entropy_loss = entropy_batch[:original_batch_size][admitted_entropy].mean()
+            else:
+                entropy_loss = entropy_batch[:original_batch_size].sum() * 0.0
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -274,7 +512,7 @@ class PPOWithExtractor(PPO):
 
             loss = surrogate_loss + \
                 self.value_loss_coef * value_loss -\
-                self.entropy_coef * entropy_batch.mean() + \
+                self.entropy_coef * entropy_loss + \
                 priv_reg_coef * priv_reg_loss
 
             # Symmetry loss
@@ -340,9 +578,10 @@ class PPOWithExtractor(PPO):
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
-            mean_entropy += entropy_batch.mean().item()
+            mean_entropy += entropy_loss.item()
             mean_priv_reg_loss += priv_reg_loss.mean().item()
             mean_estimator_loss += estimator_loss.item()
+            mean_admitted_count += admission_batch.sum().item() / num_aug
 
             # -- RND loss
             if mean_rnd_loss is not None:
@@ -357,6 +596,7 @@ class PPOWithExtractor(PPO):
         mean_priv_reg_loss /= num_updates
         mean_entropy /= num_updates
         mean_estimator_loss /= num_updates
+        mean_admitted_count /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         # -- For Symmetry
@@ -371,6 +611,7 @@ class PPOWithExtractor(PPO):
             "priv_reg": mean_priv_reg_loss,
             "entropy": mean_entropy,
             'estimator':mean_estimator_loss,
+            'admitted_count': mean_admitted_count,
             'priv_reg_coef': priv_reg_coef
         }
         if self.rnd:
@@ -401,6 +642,7 @@ class PPOWithExtractor(PPO):
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            admission_batch,
         ) in generator:
             with torch.inference_mode():
                 self.policy.act(obs_batch, 

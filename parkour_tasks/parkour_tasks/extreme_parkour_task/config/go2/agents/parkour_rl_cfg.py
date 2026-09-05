@@ -52,6 +52,8 @@ class ParkourRslRlEstimatorCfg(ParkourRslRlBaseCfg):
 class ParkourRslRlActorCfg(ParkourRslRlBaseCfg):
     class_name: str = "Actor"
     state_history_encoder: ParkourRslRlStateHistEncoderCfg = MISSING
+    action_horizon: int = 40
+    command_dim: int = 34
 
 
 @configclass
@@ -78,4 +80,3 @@ class ParkourRslRlOnPolicyRunnerCfg(RslRlOnPolicyRunnerCfg):
     estimator: ParkourRslRlEstimatorCfg = MISSING
     depth_encoder: ParkourRslRlDepthEncoderCfg | None = None
     algorithm: ParkourRslRlPpoAlgorithmCfg | ParkourRslRlDistillationAlgorithmCfg = MISSING
-

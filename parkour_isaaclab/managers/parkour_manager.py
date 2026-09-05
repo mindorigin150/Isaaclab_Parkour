@@ -41,14 +41,14 @@ class ParkourTerm(CommandTerm):
         if len(env_ids) != 0:
             self._resample_command(env_ids)
 
-    def compute(self, dt: float):
+    def compute(self, dt: float, active_mask: torch.Tensor | None = None):
         """Compute the command.
 
         Args:
             dt: The time step passed since the last call to compute.
         """
-        self._update_command()
-        self._update_metrics()
+        self._update_command(active_mask)
+        self._update_metrics(active_mask)
 
     @property
     def has_debug_vis_implementation(self) -> bool:
@@ -61,6 +61,10 @@ class ParkourManager(CommandManager):
     _env: ParkourManagerBasedRLEnv
     def __init__(self, cfg: object, env: ParkourManagerBasedRLEnv):        
         super().__init__(cfg, env) 
+
+    def compute(self, dt: float, active_mask: torch.Tensor | None = None):
+        for term in self._terms.values():
+            term.compute(dt, active_mask=active_mask)
 
     @property
     def has_debug_vis_implementation(self) -> bool:

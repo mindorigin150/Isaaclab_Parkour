@@ -85,24 +85,33 @@ class ParkourEvent(ParkourTerm):
         self.next_target_yaw = torch.atan2(target_vec_norm[:, 1], target_vec_norm[:, 0])
 
     def _gather_cur_goals(self, future=0):
-        return self.env_goals.gather(1, (self.cur_goal_idx[:, None, None]+future).expand(-1, -1, self.env_goals.shape[-1])).squeeze(1)
+        goal_idx = self.cur_goal_idx + future
+        return self.env_goals.gather(
+            1, goal_idx[:, None, None].expand(-1, -1, self.env_goals.shape[-1])
+        ).squeeze(1)
 
     def __str__(self) -> str:
         msg = "ParkourCommand:\n"
         msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"
         return msg
     
-    def _update_command(self):
+    def _update_command(self, active_mask: torch.Tensor | None = None):
         """Re-target the current goal position to the current root state."""
         next_flag = self.reach_goal_timer > self.reach_goal_delay / self.simulation_time
+        if active_mask is not None:
+            next_flag &= active_mask
         if self.debug_vis:
-            tmp_mask = torch.nonzero(self.cur_goal_idx>0).squeeze(-1)
+            tmp_mask = torch.nonzero(
+                (self.cur_goal_idx > 0) & (self.cur_goal_idx < self.num_goals)
+            ).squeeze(-1)
             if tmp_mask.numel() > 0:
                 self.future_goal_idx[tmp_mask, self.cur_goal_idx[tmp_mask]] = False
         self.cur_goal_idx[next_flag] += 1
         self.reach_goal_timer[next_flag] = 0
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
         self.reached_goal_ids = torch.norm(robot_root_pos_w - self.cur_goals[:, :2], dim=1) < self.next_goal_threshold
+        if active_mask is not None:
+            self.reached_goal_ids &= active_mask
         reached_goal_idx = self.reached_goal_ids.nonzero(as_tuple=False).squeeze(-1)
         if reached_goal_idx.numel() > 0:
             self.reach_goal_timer[reached_goal_idx] += 1
@@ -146,6 +155,9 @@ class ParkourEvent(ParkourTerm):
                                                        torch.clip(self.terrain.terrain_levels[env_ids], 0)) # (the minumum level is zero)
         self.env_origins[env_ids] = self.terrain.terrain_origins[self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]]
         self.env_class[env_ids] = self.terrain_class[self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]]
+
+        self.cur_goal_idx[env_ids] = 0
+        self.reach_goal_timer[env_ids] = 0
         
         temp = self.terrain_goals[self.terrain.terrain_levels, self.terrain.terrain_types]
         last_col = temp[:, -1].unsqueeze(1)
@@ -167,21 +179,27 @@ class ParkourEvent(ParkourTerm):
             self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]
         ]
 
-        self.reach_goal_timer[env_ids] = 0
-        self.cur_goal_idx[env_ids] = 0
-
         if self.debug_vis:
             self.future_goal_idx[env_ids, 0] = False
             self.future_goal_idx[env_ids, 1:] = True
             self.env_per_heights = self.total_heights[self.terrain.terrain_levels, self.terrain.terrain_types]
 
-    def _update_metrics(self):
+    def _update_metrics(self, active_mask: torch.Tensor | None = None):
         # logs data
-        self.metrics["terrain_levels"].copy_(self.terrain.terrain_levels.float())
+        terrain_levels = self.terrain.terrain_levels.float()
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
-        self.metrics["far_from_current_goal"].copy_(torch.norm(self.cur_goals[:, :2] - robot_root_pos_w,dim =-1) - self.next_goal_threshold)
-        self.metrics["current_goal_idx"].copy_(self.cur_goal_idx.to(dtype=float))
-        self.metrics["how_far_from_start_point"].copy_(self.dis_to_start_pos)
+        far_from_goal = torch.norm(self.cur_goals[:, :2] - robot_root_pos_w, dim=-1) - self.next_goal_threshold
+        current_goal_idx = self.cur_goal_idx.to(dtype=float)
+        if active_mask is None:
+            self.metrics["terrain_levels"].copy_(terrain_levels)
+            self.metrics["far_from_current_goal"].copy_(far_from_goal)
+            self.metrics["current_goal_idx"].copy_(current_goal_idx)
+            self.metrics["how_far_from_start_point"].copy_(self.dis_to_start_pos)
+        else:
+            self.metrics["terrain_levels"][active_mask] = terrain_levels[active_mask]
+            self.metrics["far_from_current_goal"][active_mask] = far_from_goal[active_mask]
+            self.metrics["current_goal_idx"][active_mask] = current_goal_idx[active_mask]
+            self.metrics["how_far_from_start_point"][active_mask] = self.dis_to_start_pos[active_mask]
         
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first tome

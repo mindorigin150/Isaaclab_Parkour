@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 from parkour_isaaclab.actor import Actor
+from .command_actor import CommandActor
 from rsl_rl.utils import resolve_nn_activation
 
 class ActorCriticRMA(nn.Module):

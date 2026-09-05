@@ -190,11 +190,18 @@ def randomize_rigid_body_com(
 
 def push_by_setting_velocity(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | None,
     velocity_range: dict[str, tuple[float, float]],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-):  
+):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
+    if env_ids is None:
+        active_mask = env._latency_eval_active_mask
+        env_ids = (
+            active_mask.nonzero(as_tuple=False).squeeze(-1)
+            if active_mask is not None
+            else torch.arange(env.num_envs, device=asset.device)
+        )
     vel_w = asset.data.root_vel_w[env_ids]
     range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
     ranges = torch.tensor(range_list, device=asset.device)

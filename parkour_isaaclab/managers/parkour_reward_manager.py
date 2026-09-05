@@ -22,6 +22,7 @@ class ParkourRewardManager(RewardManager):
         # reset computation
         self._reward_buf[:] = 0.0
         # iterate over all the reward terms
+        active_mask = self._env._latency_eval_active_mask
         for term_idx, (name, term_cfg) in enumerate(zip(self._term_names, self._term_cfgs)):
             # skip if weight is zero (kind of a micro-optimization)
             if term_cfg.weight == 0.0:
@@ -29,6 +30,8 @@ class ParkourRewardManager(RewardManager):
                 continue
             # compute term's value
             value = term_cfg.func(self._env, **term_cfg.params) * term_cfg.weight * dt
+            if active_mask is not None:
+                value = value.masked_fill(~active_mask, 0.0)
             # update total reward
             self._reward_buf += value
             # update episodic sum

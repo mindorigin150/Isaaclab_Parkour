@@ -113,9 +113,14 @@ class ExtremeParkourObservations(ManagerTermBase):
                                   self._obs_history_buffer.view(self.num_envs, -1)
                                   ],dim=-1)
         obs_buf[:, 6:8] = 0
-        self._obs_history_buffer[:, :-1] = self._obs_history_buffer[:, 1:].clone()
-        self._obs_history_buffer[:, -1] = obs_buf
-        reset_mask = env.episode_length_buf <= 1
+        active_mask = env._latency_eval_active_mask
+        if active_mask is None:
+            active_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self._obs_history_buffer[active_mask, :-1] = self._obs_history_buffer[
+            active_mask, 1:
+        ].clone()
+        self._obs_history_buffer[active_mask, -1] = obs_buf[active_mask]
+        reset_mask = active_mask & (env.episode_length_buf <= 1)
         self._obs_history_buffer[reset_mask] = obs_buf[reset_mask].unsqueeze(1)
         return observations 
 

@@ -41,17 +41,35 @@ class UniformParkourCommand(CommandTerm):
         return self.vel_command_b
 
 
-    def _update_metrics(self):
+    def compute(self, dt: float):
+        active_mask = self._env._latency_eval_active_mask
+        if active_mask is None:
+            return super().compute(dt)
+        self._update_metrics(active_mask)
+        self.time_left[active_mask] -= dt
+        resample_env_ids = (self.time_left <= 0.0).nonzero().flatten()
+        resample_env_ids = resample_env_ids[active_mask[resample_env_ids]]
+        if len(resample_env_ids) > 0:
+            self._resample(resample_env_ids)
+        self._update_command(active_mask)
+
+    def _update_metrics(self, active_mask: torch.Tensor | None = None):
         # time for which the command was executed
         max_command_time = self.cfg.resampling_time_range[1]
         max_command_step = max_command_time / self._env.step_dt
         # logs data
-        self.metrics["error_vel_xy"] += (
+        values_xy = (
             torch.norm(self.vel_command_b[:, :2] - self.robot.data.root_lin_vel_b[:, :2], dim=-1) / max_command_step
         )
-        self.metrics["error_vel_yaw"] += (
+        values_yaw = (
             torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b[:, 2]) / max_command_step
         )
+        if active_mask is None:
+            self.metrics["error_vel_xy"] += values_xy
+            self.metrics["error_vel_yaw"] += values_yaw
+        else:
+            self.metrics["error_vel_xy"][active_mask] += values_xy[active_mask]
+            self.metrics["error_vel_yaw"][active_mask] += values_yaw[active_mask]
 
     def _resample_command(self, env_ids: Sequence[int]):
         # sample velocity commands
@@ -68,14 +86,15 @@ class UniformParkourCommand(CommandTerm):
             self.vel_command_b[env_ids, :2] *= torch.abs(self.vel_command_b[env_ids, 0:1]) \
                                             > self.cfg.clips.lin_vel_clip
             
-    def _update_command(self):
+    def _update_command(self, active_mask: torch.Tensor | None = None):
         heading_error = math_utils.wrap_to_pi(self.heading_target  - \
                                             self.robot.data.heading_w) * self.cfg.heading_control_stiffness
-        self.vel_command_b[:, 2] = torch.clip(heading_error,
-                    min= -1,
-                    max= 1,
-                    )
-        self.vel_command_b[:, 2] *= torch.abs(self.vel_command_b[:, 2]) > self.cfg.clips.ang_vel_clip
+        angular_command = torch.clip(heading_error, min=-1, max=1)
+        angular_command *= torch.abs(angular_command) > self.cfg.clips.ang_vel_clip
+        if active_mask is None:
+            self.vel_command_b[:, 2] = angular_command
+        else:
+            self.vel_command_b[active_mask, 2] = angular_command[active_mask]
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
