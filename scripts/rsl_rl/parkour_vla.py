@@ -15,6 +15,7 @@ import random
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import gymnasium as gym
@@ -34,6 +35,7 @@ for import_root in map(
 sys.path[:0] = [str(PARKOUR_TASKS_ROOT), str(PARKOUR_REPO_ROOT), str(REPO_ROOT)]
 
 from latency_bench.core.latency_distribution import derive_seed
+from latency_bench.core.config import load_config
 from latency_bench.core.types import Action, Observation, StepResult
 from latency_bench.data.parkour_dagger import PARKOUR_ACTION_HORIZON
 from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
@@ -62,6 +64,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--disable_fabric", action="store_true")
     parser.add_argument("--use_pretrained_checkpoint", action="store_true")
+    parser.add_argument(
+        "--command-checkpoint",
+        type=Path,
+        help="Native latency-command actor used by collection; --checkpoint remains the decoder.",
+    )
+    parser.add_argument("--latency-config", type=Path)
+    parser.add_argument("--keep-failed", action="store_true")
     parser.add_argument("--output_dir", type=Path)
     parser.add_argument("--train_episodes", type=int, default=250)
     parser.add_argument("--val_episodes", type=int, default=25)
@@ -85,6 +94,8 @@ if __name__ == "__main__":
             if args_cli.mode == "dagger-collect"
             else 50
         )
+    if args_cli.mode == "latency-eval":
+        args_cli.headless = True
     args_cli.enable_cameras = True
 
     app_launcher = AppLauncher(args_cli)
@@ -151,12 +162,32 @@ def _load_environment_and_teacher():
         env = multi_agent_to_single_agent(env)
     env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    runner = OnPolicyRunnerWithExtractor(
+    decoder_runner = OnPolicyRunnerWithExtractor(
         env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
     )
-    runner.load(resume_path, load_optimizer=False)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-    return env, runner.alg.policy.actor, policy, Path(resume_path)
+    decoder_runner.load(resume_path, load_optimizer=False)
+    decoder_policy = decoder_runner.get_inference_policy(device=env.unwrapped.device)
+    if args_cli.command_checkpoint is None:
+        return env, decoder_runner.alg.policy.actor, decoder_policy, Path(resume_path)
+
+    command_env = ParkourRslRlVecEnvWrapper(
+        env, clip_actions=agent_cfg.clip_actions
+    )
+    command_env.num_actions = PARKOUR_ACTION_HORIZON * PARKOUR_VLA_ACTION_DIM
+    command_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    command_cfg.policy.actor.class_name = "CommandActor"
+    command_cfg.policy.actor.action_horizon = PARKOUR_ACTION_HORIZON
+    command_cfg.policy.actor.command_dim = PARKOUR_VLA_ACTION_DIM
+    command_runner = OnPolicyRunnerWithExtractor(
+        command_env, command_cfg.to_dict(), log_dir=None, device=command_cfg.device
+    )
+    command_runner.load(args_cli.command_checkpoint, load_optimizer=False)
+    return (
+        env,
+        command_runner.get_inference_policy(device=env.unwrapped.device),
+        decoder_policy,
+        Path(resume_path),
+    )
 
 
 def _parkour_actor_action(env, actor, observation, action_value):
@@ -197,6 +228,7 @@ class ParkourEnvStepBackend:
         self._edge_sum = torch.zeros(self._num_slots, dtype=torch.float64)
         self._edge_sq_sum = torch.zeros(self._num_slots, dtype=torch.float64)
         self._edge_steps = torch.zeros(self._num_slots, dtype=torch.int64)
+        self._last_motor_action: torch.Tensor | None = None
         self.slot_handles = [
             RemoteEnvSlotHandle(
                 slot_id=slot_id,
@@ -233,6 +265,8 @@ class ParkourEnvStepBackend:
         )
         obs_dict, _ = self._raw_env.reset(seed=seed, env_ids=env_ids)
         self._obs = obs_dict["policy"]
+        if self._last_motor_action is not None:
+            self._last_motor_action[slot_id] = 0.0
         self._edge_sum[slot_id] = 0.0
         self._edge_sq_sum[slot_id] = 0.0
         self._edge_steps[slot_id] = 0
@@ -258,6 +292,8 @@ class ParkourEnvStepBackend:
         start = time.perf_counter()
         slot_ids = [int(slot_id) for slot_id in actions_by_slot]
         goal_index = self._parkour.cur_goal_idx.clone()
+        active_mask = torch.zeros(self._num_slots, dtype=torch.bool, device=self._obs.device)
+        active_mask[slot_ids] = True
         vla_action = torch.zeros(
             (self._num_slots, PARKOUR_VLA_LATENT_DIM + PARKOUR_VLA_YAW_DIM),
             dtype=self._obs.dtype,
@@ -272,8 +308,12 @@ class ParkourEnvStepBackend:
         motor_action = _parkour_actor_action(
             self._env, self._actor, self._obs, vla_action
         )
+        if self._last_motor_action is not None:
+            motor_action = motor_action.clone()
+            motor_action[~active_mask] = self._last_motor_action[~active_mask]
+        self._last_motor_action = motor_action.detach().clone()
         obs_dict, rewards, terminated, truncated, _extras = self._raw_env.step_no_reset(
-            motor_action
+            motor_action, active_mask=active_mask
         )
         self._obs = obs_dict["policy"]
         successes = self._raw_env.termination_manager.get_term("parkour_success")
@@ -631,6 +671,9 @@ def _collect(env, actor, teacher_policy, checkpoint: Path) -> dict:
     latent = torch.zeros(
         (num_envs, PARKOUR_VLA_LATENT_DIM), dtype=obs.dtype, device=env.device
     )
+    commands = torch.zeros(
+        (num_envs, PARKOUR_VLA_ACTION_DIM), dtype=obs.dtype, device=env.device
+    )
     block_terminated = [False] * num_envs
     block_success = [False] * num_envs
     rows_by_slot: list[list[dict]] = [[] for _ in range(num_envs)]
@@ -645,13 +688,16 @@ def _collect(env, actor, teacher_policy, checkpoint: Path) -> dict:
             rgb = _rgb_frames(env)
             with torch.inference_mode():
                 latent[due_ids] = actor.infer_scandots_latent(obs[due_ids])
-            latent_cpu = latent[due_ids].detach().cpu().numpy()
+                commands[due_ids] = torch.cat(
+                    (
+                        latent[due_ids],
+                        obs[due_ids, 6:8] / GO2_PARKOUR_YAW_SCALE,
+                    ),
+                    dim=1,
+                )
+            due_actions = commands[due_ids].detach().cpu().numpy()
             due_states = _masked_vla_state(
                 obs_cpu[due_slots, :PARKOUR_VLA_PROPRIO_DIM]
-            )
-            due_actions = np.concatenate(
-                (latent_cpu, obs_cpu[due_slots, 6:8] / GO2_PARKOUR_YAW_SCALE),
-                axis=1,
             )
             for slot, state, action in zip(due_slots, due_states, due_actions):
                 block_terminated[slot] = False
@@ -670,7 +716,14 @@ def _collect(env, actor, teacher_policy, checkpoint: Path) -> dict:
         for slot in range(num_envs):
             rows_by_slot[slot][-1]["actor_observation"].append(obs_cpu[slot].copy())
         with torch.inference_mode():
-            actions = teacher_policy(obs, hist_encoding=True, scandots_latent=latent)
+            actor_observation = _actor_observation_with_yaw(
+                obs, commands[:, PARKOUR_VLA_LATENT_DIM:]
+            )
+            actions = teacher_policy(
+                actor_observation,
+                hist_encoding=True,
+                scandots_latent=commands[:, :PARKOUR_VLA_LATENT_DIM],
+            )
         obs, rewards, dones, _ = env.step(actions)
         successes = env.unwrapped.termination_manager.get_term("parkour_success")
         rewards_cpu = rewards.detach().cpu().numpy()
@@ -743,8 +796,125 @@ def _collect(env, actor, teacher_policy, checkpoint: Path) -> dict:
     return metadata
 
 
+def _collect_latency(env, command_policy, decoder_policy, checkpoint: Path) -> dict:
+    # Isaac's app must be initialized before importing the tensor training adapter.
+    from training.common.command_latency import CommandLatencyBatch
+
+    config = load_config(args_cli.latency_config)
+    output = args_cli.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    splits = ["train"] * args_cli.train_episodes + ["val"] * args_cli.val_episodes
+    random.Random(args_cli.split_seed).shuffle(splits)
+    transport = CommandLatencyBatch(
+        config, num_envs=env.num_envs, device=env.device,
+        noop_command=torch.zeros(PARKOUR_VLA_ACTION_DIM, device=env.device),
+    )
+    transport.reset()
+    obs, _ = env.get_observations()
+    commands = torch.zeros(
+        env.num_envs, PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM,
+        device=env.device, dtype=obs.dtype,
+    )
+    rows = [[] for _ in range(env.num_envs)]
+    actor_inputs = [[] for _ in range(env.num_envs)]
+    terminations = [[] for _ in range(env.num_envs)]
+    control_traces = [[] for _ in range(env.num_envs)]
+    accepted = 0
+    completed = 0
+    raw_steps = 0
+    while accepted < len(splits):
+        due = [slot for slot, frame in enumerate(transport.frames)
+               if frame % transport.clock.obs_stride_raw_frames == 0]
+        if due:
+            with torch.inference_mode():
+                commands[due] = command_policy(obs[due]).reshape(
+                    len(due), PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM
+                )
+                if env.clip_actions is not None:
+                    commands[due] = commands[due].clamp(-env.clip_actions, env.clip_actions)
+            admitted = transport.submit(commands, env_ids=due).nonzero().flatten().tolist()
+            if admitted:
+                rgb = _rgb_frames(env)
+                states = _masked_vla_state(
+                    obs[admitted, :PARKOUR_VLA_PROPRIO_DIM].cpu().numpy()
+                )
+                for slot, state in zip(admitted, states):
+                    rows[slot].append({
+                        "rgb": rgb[slot], "observation.state": state,
+                        "action": commands[slot].cpu().numpy().copy(),
+                        "raw_reward": 0.0, **transport.last_submission[slot],
+                    })
+        before_step = obs.cpu().numpy()
+        for slot in range(env.num_envs):
+            actor_inputs[slot].append(before_step[slot].copy())
+        applied = transport.actions()
+        applied_cpu = applied.cpu().numpy()
+        motor_actions = _parkour_actor_action(env, decoder_policy, obs, applied)
+        obs_dict, rewards, terminated, truncated, _ = env.unwrapped.step_no_reset(motor_actions)
+        obs = obs_dict["policy"]
+        done = terminated | truncated
+        success = env.unwrapped.termination_manager.get_term("parkour_success")
+        for slot in range(env.num_envs):
+            terminations[slot].append(done[slot].item())
+            rows[slot][-1]["raw_reward"] += rewards[slot].item()
+            control_traces[slot].append({
+                "applied_command": applied_cpu[slot].copy(),
+                **transport.last_application[slot],
+                "reward": rewards[slot].item(), "done": done[slot].item(),
+            })
+        transport.advance()
+        raw_steps += env.num_envs
+        done_ids = done.nonzero().flatten().tolist()
+        for slot in done_ids:
+            completed += 1
+            if accepted < len(splits) and (args_cli.keep_failed or success[slot].item()):
+                observations = np.stack(actor_inputs[slot])
+                terminal = np.asarray(terminations[slot], dtype=bool)
+                for row in rows[slot]:
+                    start = row["issued_raw_frame"]
+                    aligned = observations[start:start + PARKOUR_ACTION_HORIZON]
+                    mask = terminal[start:start + PARKOUR_ACTION_HORIZON]
+                    padding = PARKOUR_ACTION_HORIZON - len(aligned)
+                    row["actor_observation"] = np.pad(aligned, ((0, padding), (0, 0)), mode="edge")
+                    row["termination"] = np.pad(mask, (0, padding), constant_values=True)
+                control_trace = {
+                    f"control_{name}": np.asarray([frame[name] for frame in control_traces[slot]])
+                    for name in control_traces[slot][0]
+                }
+                _write_dagger_shard(
+                    output, accepted, rows[slot], split=splits[accepted],
+                    control_trace=control_trace,
+                )
+                accepted += 1
+                print(f"accepted {accepted}/{len(splits)}: slot={slot} raw_frames={len(terminal)}", flush=True)
+            rows[slot] = []
+            actor_inputs[slot] = []
+            terminations[slot] = []
+            control_traces[slot] = []
+        if done_ids:
+            reset_obs, _ = env.unwrapped.reset(env_ids=torch.tensor(done_ids, device=env.device))
+            obs = reset_obs["policy"]
+            transport.reset(done_ids)
+    metadata = {
+        "schema_version": 7, "env_name": "extreme_parkour_go2",
+        "rows_unit": "admitted_observation", "env_fps": config["env"]["env_fps"],
+        "obs_fps": config["env"]["obs_fps"],
+        "issued_command_shape": [PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM],
+        "actor_observation_shape": [PARKOUR_ACTION_HORIZON, PARKOUR_ACTOR_OBSERVATION_DIM],
+        "termination_shape": [PARKOUR_ACTION_HORIZON], "train_episodes": args_cli.train_episodes,
+        "val_episodes": args_cli.val_episodes, "completed_episodes": completed,
+        "raw_steps": raw_steps, "keep_failed": args_cli.keep_failed,
+        "command_checkpoint": str(args_cli.command_checkpoint.resolve()),
+        "decoder_checkpoint": str(checkpoint.resolve()), "latency_config": config,
+        "shard_format": "npz+mp4", "shard_root": "rollout_shards",
+    }
+    (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    return metadata
+
+
 def _write_dagger_shard(
-    output_dir: Path, shard_index: int, rows: list[dict], *, split: str = "train"
+    output_dir: Path, shard_index: int, rows: list[dict], *, split: str = "train",
+    control_trace: dict | None = None,
 ) -> tuple[Path, Path]:
     video_tmp = output_dir / f".dagger_shard_{shard_index:06d}.tmp.mp4"
 
@@ -795,6 +965,11 @@ def _write_dagger_shard(
         payload["raw_reward"] = np.asarray(
             [row["raw_reward"] for row in rows], dtype=np.float32
         )
+    if payload["action"].ndim == 3:
+        for field in ("episode_id", "obs_id", "issued_raw_frame", "ready_raw_frame", "latency_ms", "worker_id"):
+            payload[field] = np.asarray([row[field] for row in rows])
+    if control_trace is not None:
+        payload.update(control_trace)
     # Keep the video-backed writer at the collection boundary so Isaac Lab can
     # run without importing conversion-only dependencies.
     from latency_bench.data.parkour_dagger import write_parkour_dagger_shard
@@ -1026,8 +1201,6 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
 
 
 def main() -> None:
-    from latency_bench.core.config import load_config
-
     if args_cli.mode == "latency-eval":
         args_cli.eval_config = load_config(args_cli.eval_config)
         args_cli.checkpoint = args_cli.eval_config["env"]["runtime_checkpoint_path"]
@@ -1036,12 +1209,17 @@ def main() -> None:
         args_cli.max_episode_steps = args_cli.eval_config["evaluation"]["eval_max_steps"]
         args_cli.seed = args_cli.eval_config["experiment"]["seed"]
         args_cli.device = args_cli.eval_config["env"]["simulator_device"]
-    env, actor, teacher_policy, checkpoint = _load_environment_and_teacher()
+    exit_code = 0
+    env = None
     try:
+        env, actor, teacher_policy, checkpoint = _load_environment_and_teacher()
         if args_cli.startup_ready_file is not None:
             args_cli.startup_ready_file.touch()
         if args_cli.mode == "collect":
-            result = _collect(env, actor, teacher_policy, checkpoint)
+            if args_cli.command_checkpoint is None:
+                result = _collect(env, actor, teacher_policy, checkpoint)
+            else:
+                result = _collect_latency(env, actor, teacher_policy, checkpoint)
         elif args_cli.mode == "dagger-collect":
             result = _collect_dagger(env, actor, teacher_policy, checkpoint)
         elif args_cli.mode == "latency-eval":
@@ -1067,12 +1245,16 @@ def main() -> None:
                     encoding="utf-8",
                 )
         print(json.dumps(result, indent=2, sort_keys=True))
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
     finally:
-        env.close()
+        if env is not None:
+            env.close()
+        simulation_app.close()
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        simulation_app.close()
+    main()

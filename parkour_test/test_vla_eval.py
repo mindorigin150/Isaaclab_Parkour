@@ -1,10 +1,48 @@
 import importlib.util
+import sys
 import time
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
+
+
+def _load_ppo_with_extractor(monkeypatch):
+    """Load the PPO module without importing the Isaac Lab package graph."""
+    rsl_rl = types.ModuleType("rsl_rl")
+    algorithms = types.ModuleType("rsl_rl.algorithms")
+    algorithms.PPO = type("PPO", (), {})
+    storage = types.ModuleType("rsl_rl.storage")
+    rollout_storage = types.ModuleType("rsl_rl.storage.rollout_storage")
+    rollout_storage.RolloutStorage = type("RolloutStorage", (), {})
+    rollout_storage.split_and_pad_trajectories = lambda *_args: None
+    rsl_rl.__path__ = []
+    algorithms.__path__ = []
+    storage.__path__ = []
+    monkeypatch.setitem(sys.modules, "rsl_rl", rsl_rl)
+    monkeypatch.setitem(sys.modules, "rsl_rl.algorithms", algorithms)
+    monkeypatch.setitem(sys.modules, "rsl_rl.storage", storage)
+    monkeypatch.setitem(sys.modules, "rsl_rl.storage.rollout_storage", rollout_storage)
+
+    package = types.ModuleType("ppo_test_package")
+    package.__path__ = []
+    actor_critic = types.ModuleType("ppo_test_package.actor_critic_with_encoder")
+    actor_critic.ActorCriticRMA = type("ActorCriticRMA", (), {})
+    monkeypatch.setitem(sys.modules, "ppo_test_package", package)
+    monkeypatch.setitem(
+        sys.modules, "ppo_test_package.actor_critic_with_encoder", actor_critic
+    )
+
+    script = Path(__file__).parents[1] / "scripts/rsl_rl/modules/ppo_with_extractor.py"
+    spec = importlib.util.spec_from_file_location(
+        "ppo_test_package.ppo_with_extractor", script
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module.PPOWithExtractor
 
 
 def _load_parkour_vla_module():
@@ -20,6 +58,202 @@ def _load_parkour_vla_module():
     module.PARKOUR_VLA_YAW_DIM = 2
     module.PARKOUR_VLA_ACTION_DIM = 34
     return module
+
+
+def test_latency_collection_preserves_full_issued_chunks_and_terminal_alignment(tmp_path, monkeypatch):
+    """Long-lived collection contract: admitted H40 labels survive delayed control and resets."""
+    module = _load_parkour_vla_module()
+    module.PARKOUR_VLA_PROPRIO_DIM = 53
+    module.GO2_PARKOUR_YAW_SCALE = 1.0
+    config = tmp_path / "latency.yaml"
+    config.write_text(
+        "env: {env_fps: 50, obs_fps: 10}\n"
+        "latency: {method: fixed, fixed_latency_ms: 200, seed: 7}\n"
+        "executor: {simulated_worker_capacity: 1}\n"
+        "scheduler: {ordering_policy: latest_ready, hold_policy: hold}\n"
+    )
+    module.args_cli = SimpleNamespace(
+        latency_config=config, output_dir=tmp_path / "raw", train_episodes=1,
+        val_episodes=1, split_seed=0, keep_failed=True,
+        command_checkpoint=tmp_path / "command.pt",
+    )
+
+    class Env:
+        num_envs = 1
+        device = "cpu"
+        clip_actions = None
+
+        def __init__(self):
+            self.unwrapped = self
+            self.obs = torch.zeros(1, 753)
+            self.applied = []
+            self.termination_manager = SimpleNamespace(get_term=lambda _: torch.tensor([False]))
+
+        def get_observations(self):
+            return self.obs, {}
+
+        def step_no_reset(self, action):
+            self.applied.append(action.item())
+            self.obs = self.obs + 1
+            return {"policy": self.obs}, torch.ones(1), self.obs[:, 0] == 12, torch.zeros(1, dtype=torch.bool), {}
+
+        def reset(self, *, env_ids):
+            self.obs = torch.zeros(1, 753)
+            return {"policy": self.obs}, {}
+
+    env = Env()
+    episodes = []
+    monkeypatch.setattr(module, "_rgb_frames", lambda _: np.zeros((1, 2, 2, 3), dtype=np.uint8))
+    monkeypatch.setattr(module, "_write_dagger_shard",
+        lambda output, index, rows, *, split, control_trace: episodes.append((split, rows, control_trace)))
+
+    def command_policy(obs):
+        return torch.arange(40).reshape(1, 40, 1).expand(len(obs), 40, 34) + obs[:, :1, None] * 1000
+
+    def decoder(obs, *, hist_encoding, scandots_latent):
+        return scandots_latent[:, :1]
+
+    metadata = module._collect_latency(env, command_policy, decoder, tmp_path / "decoder.pt")
+    assert metadata["raw_steps"] == 24
+    assert {split for split, _, _ in episodes} == {"train", "val"}
+    assert env.applied == ([0.0] * 10 + [10.0, 11.0]) * 2
+    for _, rows, trace in episodes:
+        np.testing.assert_array_equal(trace["control_source_raw_frame"], [-1] * 10 + [0, 0])
+        np.testing.assert_array_equal(trace["control_chunk_index"], [-1] * 10 + [10, 11])
+        np.testing.assert_array_equal(trace["control_applied_command"][:, 0], [0] * 10 + [10, 11])
+        np.testing.assert_array_equal(trace["control_done"], [False] * 11 + [True])
+        assert [row["issued_raw_frame"] for row in rows] == [0, 10]
+        assert [row["ready_raw_frame"] for row in rows] == [10, 20]
+        np.testing.assert_array_equal(rows[0]["action"][:, 0], np.arange(40))
+        np.testing.assert_array_equal(rows[1]["action"][:, 0], np.arange(40) + 10000)
+        np.testing.assert_array_equal(rows[0]["actor_observation"][:12, 0], np.arange(12))
+        np.testing.assert_array_equal(rows[1]["actor_observation"][:2, 0], [10, 11])
+        assert rows[0]["termination"].tolist() == [False] * 11 + [True] * 29
+        assert rows[1]["termination"].tolist() == [False] + [True] * 39
+        assert sum(row["raw_reward"] for row in rows) == 12
+
+
+def test_single_admitted_transition_has_finite_surrogate_loss(monkeypatch):
+    PPOWithExtractor = _load_ppo_with_extractor(monkeypatch)
+
+    class Actor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.history_encoder = torch.nn.Linear(1, 1)
+
+        def infer_priv_latent(self, obs):
+            return obs[:, :1] + self.history_encoder.weight[:, :1]
+
+        def infer_hist_latent(self, obs):
+            return obs[:, :1] + 2 * self.history_encoder.weight[:, :1]
+
+    class Policy(torch.nn.Module):
+        is_recurrent = False
+
+        def __init__(self):
+            super().__init__()
+            self.actor = Actor()
+            self.mean = torch.nn.Parameter(torch.tensor([[0.2]]))
+            self.value = torch.nn.Parameter(torch.tensor([[0.5]]))
+            self.distribution = None
+
+        def act(self, obs, **_kwargs):
+            self.distribution = torch.distributions.Normal(
+                self.mean.expand(len(obs), -1), torch.ones((len(obs), 1))
+            )
+            return self.distribution.sample()
+
+        def get_actions_log_prob(self, actions):
+            return self.distribution.log_prob(actions).sum(-1)
+
+        def evaluate(self, obs, **_kwargs):
+            return self.value.expand(len(obs), 1)
+
+        @property
+        def action_mean(self):
+            return self.distribution.mean
+
+        @property
+        def action_std(self):
+            return self.distribution.stddev
+
+        @property
+        def entropy(self):
+            return self.distribution.entropy().sum(-1)
+
+    class Storage:
+        def __init__(self):
+            self.num_transitions_per_env = 1
+            self.dones = torch.zeros((1, 1, 1), dtype=torch.bool)
+            self.rewards = torch.ones((1, 1, 1))
+            self.values = torch.zeros((1, 1, 1))
+            self.returns = torch.zeros((1, 1, 1))
+            self.advantages = torch.zeros((1, 1, 1))
+            self.admission = torch.ones((1, 1, 1), dtype=torch.bool)
+
+        def mini_batch_generator(self, *_args):
+            yield (
+                torch.tensor([[1.0, 2.0], [2.0, 3.0]]),
+                torch.tensor([[1.0, 2.0], [2.0, 3.0]]),
+                torch.tensor([[0.1], [0.2]]),
+                torch.tensor([[0.0], [0.0]]),
+                torch.tensor([[3.0], [100.0]]),
+                torch.tensor([[1.0], [1.0]]),
+                torch.tensor([[-0.9], [-0.9]]),
+                torch.tensor([[0.0], [0.0]]),
+                torch.tensor([[1.0], [1.0]]),
+                (None, None),
+                None,
+                None,
+                torch.tensor([[True], [False]]),
+            )
+
+        def clear(self):
+            pass
+
+    policy = Policy()
+    estimator = torch.nn.Linear(1, 1)
+    algorithm = PPOWithExtractor.__new__(PPOWithExtractor)
+    algorithm.policy = policy
+    algorithm.estimator = estimator
+    algorithm.estimator_optimizer = torch.optim.Adam(estimator.parameters(), lr=1e-3)
+    algorithm.hist_encoder_optimizer = torch.optim.Adam(
+        policy.actor.history_encoder.parameters(), lr=1e-3
+    )
+    algorithm.optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    algorithm.storage = Storage()
+    algorithm.priv_states_dim = 1
+    algorithm.num_prop = 1
+    algorithm.num_scan = 0
+    algorithm.priv_reg_coef_schedual = [0, 0, 0, 1]
+    algorithm.counter = 0
+    algorithm.lam = 0.95
+    algorithm._latency_discounts = torch.ones_like(
+        algorithm.storage.dones, dtype=torch.float32
+    )
+    algorithm.rnd = None
+    algorithm.rnd_optimizer = None
+    algorithm.symmetry = None
+    algorithm.normalize_advantage_per_mini_batch = True
+    algorithm.num_mini_batches = 1
+    algorithm.num_learning_epochs = 1
+    algorithm.is_multi_gpu = False
+    algorithm.max_grad_norm = 1.0
+    algorithm.desired_kl = None
+    algorithm.schedule = "fixed"
+    algorithm.clip_param = 0.2
+    algorithm.value_loss_coef = 1.0
+    algorithm.entropy_coef = 0.0
+    algorithm.use_clipped_value_loss = True
+
+    algorithm.normalize_advantage_per_mini_batch = False
+    algorithm.compute_returns(torch.zeros((1, 2)))
+    assert torch.isfinite(algorithm.storage.advantages).all()
+    algorithm.normalize_advantage_per_mini_batch = True
+
+    losses = algorithm.update()
+
+    assert all(torch.isfinite(torch.tensor(value)) for value in losses.values())
 
 
 class _FakeEnv:
@@ -301,8 +535,10 @@ def test_latency_backend_uses_no_reset_step_and_preserves_edge_moments():
             self.episode_length_buf[env_ids] = 0
             return {"policy": torch.zeros(2, 753)}, {}
 
-        def step_no_reset(self, _action):
-            self.episode_length_buf += 1
+        def step_no_reset(self, _action, *, active_mask=None):
+            if active_mask is None:
+                active_mask = torch.ones(2, dtype=torch.bool)
+            self.episode_length_buf[active_mask] += 1
             return (
                 {"policy": torch.zeros(2, 753)},
                 torch.ones(2),
@@ -332,12 +568,78 @@ def test_latency_backend_uses_no_reset_step_and_preserves_edge_moments():
     )[0].result
 
     assert response.done is False
-    assert raw.episode_length_buf.tolist() == [1, 1]
+    assert raw.episode_length_buf.tolist() == [1, 0]
     assert response.info["task_metric_moments"]["edge_violation"] == {
         "sum": 1.0,
         "sum_sq": 1.0,
         "count": 1,
     }
+
+
+def test_latency_backend_leaves_completed_slots_inactive():
+    module = _load_parkour_vla_module()
+    module.PARKOUR_VLA_PROPRIO_DIM = 53
+    module.GO2_PARKOUR_YAW_SCALE = 1.5
+    module._rgb_frames = lambda _env: np.zeros((2, 1, 1, 3), dtype=np.uint8)
+
+    class RawEnv:
+        step_dt = 0.02
+        device = torch.device("cpu")
+        episode_length_buf = torch.zeros(2, dtype=torch.long)
+        reward_manager = SimpleNamespace(
+            get_term_cfg=lambda _name: SimpleNamespace(
+                func=SimpleNamespace(feet_at_edge=torch.zeros((2, 2), dtype=torch.bool))
+            )
+        )
+        parkour_manager = SimpleNamespace(
+            get_term=lambda _name: SimpleNamespace(
+                cur_goal_idx=torch.zeros(2, dtype=torch.long), num_goals=4
+            )
+        )
+        termination_manager = SimpleNamespace(
+            get_term=lambda _name: torch.tensor([False, False])
+        )
+        seen_actions = []
+
+        def step_no_reset(self, _action, *, active_mask):
+            self.seen_actions.append(_action.clone())
+            self.episode_length_buf[active_mask] += 1
+            return (
+                {"policy": torch.zeros(2, 753)},
+                torch.ones(2),
+                torch.zeros(2, dtype=torch.bool),
+                torch.zeros(2, dtype=torch.bool),
+                {},
+            )
+
+    raw = RawEnv()
+    env = SimpleNamespace(
+        num_envs=2,
+        unwrapped=raw,
+        device=torch.device("cpu"),
+        get_observations=lambda: (torch.zeros(2, 753), {}),
+        close=lambda: None,
+    )
+    actor_calls = []
+
+    def actor(obs, **_kwargs):
+        actor_calls.append(None)
+        return torch.full((len(obs), 12), float(len(actor_calls)))
+
+    backend = module.ParkourEnvStepBackend(
+        env,
+        actor,
+        noop_action=module.Action(value=np.zeros(34, dtype=np.float32)),
+    )
+
+    action = module.Action(value=np.zeros(34, dtype=np.float32))
+    backend.step_slots({0: action, 1: action})
+    backend.step_slots({1: action})
+
+    assert raw.episode_length_buf.tolist() == [1, 2]
+    assert raw.seen_actions[0][0, 0] == 1
+    assert raw.seen_actions[1][0, 0] == 1
+    assert raw.seen_actions[1][1, 0] == 2
 
 
 def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_path):
