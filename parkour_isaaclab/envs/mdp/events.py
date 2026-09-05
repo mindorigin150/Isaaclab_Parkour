@@ -38,10 +38,55 @@ def reset_joints_by_offset(
     joint_vel = asset.data.default_joint_vel[env_ids].clone()
 
     # bias these values randomly
-    joint_pos += math_utils.sample_uniform(*position_range, joint_pos.shape, joint_pos.device)
-    joint_vel += math_utils.sample_uniform(*velocity_range, joint_vel.shape, joint_vel.device)
+    joint_pos += env.latency_eval_uniform(
+        *position_range,
+        joint_pos.shape,
+        joint_pos.device,
+        env_ids,
+    )
+    joint_vel += env.latency_eval_uniform(
+        *velocity_range,
+        joint_vel.shape,
+        joint_vel.device,
+        env_ids,
+    )
     # set into the physics simulation
     asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+
+def reset_joints_by_scale(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    position_range: tuple[float, float],
+    velocity_range: tuple[float, float],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset selected robot joints by scaling their default state."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.default_joint_pos[env_ids, asset_cfg.joint_ids].clone()
+    joint_vel = asset.data.default_joint_vel[env_ids, asset_cfg.joint_ids].clone()
+    joint_pos *= env.latency_eval_uniform(
+        *position_range,
+        joint_pos.shape,
+        joint_pos.device,
+        env_ids,
+    )
+    joint_vel *= env.latency_eval_uniform(
+        *velocity_range,
+        joint_vel.shape,
+        joint_vel.device,
+        env_ids,
+    )
+    joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids, asset_cfg.joint_ids]
+    joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+    joint_vel_limits = asset.data.soft_joint_vel_limits[env_ids, asset_cfg.joint_ids]
+    joint_vel = joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
+    asset.write_joint_state_to_sim(
+        joint_pos.view(len(env_ids), -1),
+        joint_vel.view(len(env_ids), -1),
+        env_ids=env_ids,
+        joint_ids=asset_cfg.joint_ids,
+    )
 
 
 def reset_root_state(
@@ -153,7 +198,9 @@ def push_by_setting_velocity(
     vel_w = asset.data.root_vel_w[env_ids]
     range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
     ranges = torch.tensor(range_list, device=asset.device)
-    random_noise = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], vel_w.shape, device=asset.device)
+    random_noise = env.latency_eval_uniform(
+        ranges[:, 0], ranges[:, 1], vel_w.shape, asset.device, env_ids
+    )
     vel_w[:,:2] = random_noise[:,:2]
     vel_w[:,2:] += random_noise[:,2:]
     asset.write_root_velocity_to_sim(vel_w, env_ids=env_ids)
@@ -257,7 +304,9 @@ class randomize_rigid_body_material(ManagerTermBase):
         else:
             env_ids = env_ids.cpu()
 
-        bucket_ids = torch.randint(0, num_buckets, (len(env_ids),), device="cpu")
+        bucket_ids = env.latency_eval_randint(
+            num_buckets, (len(env_ids),), "cpu", env_ids
+        )
         material_samples = self.material_buckets[bucket_ids]
         total_num_shapes = self.asset.root_physx_view.max_shapes
         material_samples = material_samples.unsqueeze(1).repeat(1,total_num_shapes,1)

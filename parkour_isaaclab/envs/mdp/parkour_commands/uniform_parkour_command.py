@@ -55,11 +55,14 @@ class UniformParkourCommand(CommandTerm):
 
     def _resample_command(self, env_ids: Sequence[int]):
         # sample velocity commands
-        r = torch.empty(len(env_ids), device=self.device)
         # -- linear velocity - x direction
-        self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
+        self.vel_command_b[env_ids, 0] = self._env.latency_eval_uniform(
+            *self.cfg.ranges.lin_vel_x, (len(env_ids),), self.device, env_ids
+        )
         # heading target
-        self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
+        self.heading_target[env_ids] = self._env.latency_eval_uniform(
+            *self.cfg.ranges.heading, (len(env_ids),), self.device, env_ids
+        )
         # update standing envs
         if self.cfg.small_commands_to_zero:
             self.vel_command_b[env_ids, :2] *= torch.abs(self.vel_command_b[env_ids, 0:1]) \
@@ -118,4 +121,3 @@ class UniformParkourCommand(CommandTerm):
         arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
 
         return arrow_scale, arrow_quat
-

@@ -142,7 +142,7 @@ class ParkourEvent(ParkourTerm):
             self.terrain.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
             # # Robots that solve the last level are sent to a random one
             self.terrain.terrain_levels[env_ids] = torch.where(self.terrain.terrain_levels[env_ids]>=self.terrain.max_terrain_level,
-                                                       torch.randint_like(self.terrain.terrain_levels[env_ids], self.terrain.max_terrain_level),
+                                                       self.env.latency_eval_randint(self.terrain.max_terrain_level, self.terrain.terrain_levels[env_ids].shape, self.device, env_ids),
                                                        torch.clip(self.terrain.terrain_levels[env_ids], 0)) # (the minumum level is zero)
         self.env_origins[env_ids] = self.terrain.terrain_origins[self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]]
         self.env_class[env_ids] = self.terrain_class[self.terrain.terrain_levels[env_ids], self.terrain.terrain_types[env_ids]]

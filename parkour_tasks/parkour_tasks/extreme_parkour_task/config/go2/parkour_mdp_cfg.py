@@ -5,12 +5,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
-from isaaclab.envs.mdp.events import ( 
-randomize_rigid_body_mass,
-apply_external_force_torque,
-reset_joints_by_scale
-
-)
+from isaaclab.envs.mdp.events import randomize_rigid_body_mass, apply_external_force_torque
 from isaaclab.envs.mdp.rewards import undesired_contacts
 from parkour_isaaclab.envs.mdp.parkour_actions import DelayedJointPositionActionCfg 
 from parkour_isaaclab.envs.mdp import terminations, rewards, parkours, events, observations, parkour_commands
@@ -265,7 +260,7 @@ class EventCfg:
         mode="reset",
     )
     reset_robot_joints = EventTerm(
-        func= reset_joints_by_scale, 
+        func= events.reset_joints_by_scale,
         params={
             "position_range": (0.95, 1.05),
             "velocity_range": (0.0, 0.0),

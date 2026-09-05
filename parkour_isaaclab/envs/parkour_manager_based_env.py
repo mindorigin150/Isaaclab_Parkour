@@ -11,6 +11,7 @@ from typing import Any
 import omni.log
 from isaacsim.core.simulation_manager import SimulationManager
 from isaaclab.utils.timer import Timer
+import isaaclab.utils.math as math_utils
 from isaaclab.managers import ActionManager, ObservationManager, EventManager, RecorderManager
 from .parkour_manager_based_env_cfg import ParkourManagerBasedEnvCfg
 from parkour_isaaclab.managers import ParkourManager
@@ -29,6 +30,8 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         self.cfg = cfg
         # initialize internal variables
         self._is_closed = False
+        self._latency_eval_seeds: dict[int, int] = {}
+        self._latency_eval_generators: dict[tuple[str, int], torch.Generator] = {}
 
         # set the seed for the environment
         if self.cfg.seed is not None:
@@ -160,6 +163,7 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
         # set the seed
         if seed is not None:
             self.seed(seed)
+            self.set_latency_eval_seed(env_ids, seed)
 
         # reset state of scene
         self._reset_idx(env_ids)
@@ -182,6 +186,68 @@ class ParkourManagerBasedEnv(ManagerBasedEnv):
                 self.sim.render()
         # return observations
         return self.obs_buf, self.extras
+
+    def set_latency_eval_seed(self, env_ids: Sequence[int], seed: int) -> None:
+        """Give each eval slot an independent random stream for task terms."""
+        for env_id in env_ids:
+            env_id = int(env_id)
+            self._latency_eval_seeds[env_id] = int(seed)
+            for key in [key for key in self._latency_eval_generators if key[1] == env_id]:
+                del self._latency_eval_generators[key]
+
+    def _latency_eval_generator(self, env_id: int, device: str | torch.device) -> torch.Generator:
+        key = (str(device), int(env_id))
+        generator = self._latency_eval_generators.get(key)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self._latency_eval_seeds[int(env_id)])
+            self._latency_eval_generators[key] = generator
+        return generator
+
+    def latency_eval_uniform(
+        self,
+        low: float | torch.Tensor,
+        high: float | torch.Tensor,
+        shape: Sequence[int],
+        device: str | torch.device,
+        env_ids: Sequence[int],
+    ) -> torch.Tensor:
+        if not self._latency_eval_seeds:
+            return math_utils.sample_uniform(low, high, shape, device=device)
+        shape = tuple(int(value) for value in shape)
+        rows = []
+        low = torch.as_tensor(low, device=device)
+        high = torch.as_tensor(high, device=device)
+        for env_id in env_ids:
+            sample = torch.rand(
+                shape[1:],
+                device=device,
+                generator=self._latency_eval_generator(int(env_id), device),
+            )
+            rows.append(low + (high - low) * sample)
+        return torch.stack(rows).reshape(shape)
+
+    def latency_eval_randint(
+        self,
+        high: int,
+        shape: Sequence[int],
+        device: str | torch.device,
+        env_ids: Sequence[int],
+    ) -> torch.Tensor:
+        if not self._latency_eval_seeds:
+            return torch.randint(high, shape, device=device)
+        shape = tuple(int(value) for value in shape)
+        return torch.stack(
+            [
+                torch.randint(
+                    high,
+                    shape[1:],
+                    device=device,
+                    generator=self._latency_eval_generator(int(env_id), device),
+                )
+                for env_id in env_ids
+            ]
+        ).reshape(shape)
 
 
 
