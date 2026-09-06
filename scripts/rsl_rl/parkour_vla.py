@@ -82,6 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("--dagger_round", type=int, default=0)
     parser.add_argument("--dagger_row_budget", type=int, default=64_000)
     parser.add_argument("--dagger_shard_rows", type=int, default=1_000)
+    parser.add_argument("--action_horizon", type=int, default=40)
     parser.add_argument("--startup-ready-file", type=Path)
     cli_args.add_rsl_rl_args(parser)
     AppLauncher.add_app_launcher_args(parser)
@@ -742,7 +743,7 @@ def _collect(env, actor, teacher_policy, checkpoint: Path) -> dict:
         for slot in (phase == 0).nonzero(as_tuple=False).flatten().cpu().tolist():
             if not block_terminated[slot]:
                 continue
-            if block_success[slot] and accepted < episode_target:
+            if (block_success[slot] or args_cli.keep_failed) and accepted < episode_target:
                 split = split_order[accepted]
                 _write_dagger_shard(
                     output_dir,
@@ -1025,7 +1026,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
     all_ids = torch.arange(num_envs, device=env.device)
     phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
     action_chunk = torch.zeros(
-        (num_envs, PARKOUR_ACTION_HORIZON, PARKOUR_VLA_ACTION_DIM),
+        (num_envs, args_cli.action_horizon, PARKOUR_VLA_ACTION_DIM),
         dtype=obs.dtype,
         device=env.device,
     )
@@ -1099,7 +1100,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
                 if row is not None:
                     row["actor_observation"].append(actor_observations[slot].copy())
 
-            vla_action = action_chunk[all_ids, phase]
+            vla_action = action_chunk[all_ids, phase.clamp(max=args_cli.action_horizon - 1)]
             latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
             predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM :]
             with torch.inference_mode():
