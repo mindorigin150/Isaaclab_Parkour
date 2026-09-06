@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 from tqdm import tqdm
@@ -27,6 +28,8 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--latency-config", type=Path)
+parser.add_argument("--latency-teacher-checkpoint", type=Path)
 parser.add_argument(
     "--use_pretrained_checkpoint",
     action="store_true",
@@ -62,6 +65,7 @@ from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkp
 from parkour_tasks.extreme_parkour_task.config.go2.agents.parkour_rl_cfg import ParkourRslRlOnPolicyRunnerCfg
 
 from scripts.rsl_rl.vecenv_wrapper import ParkourRslRlVecEnvWrapper
+from scripts.rsl_rl.latency_vecenv import ParkourLatencyRslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
@@ -118,7 +122,27 @@ def main():
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    if args_cli.latency_config is not None:
+        teacher_env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        teacher_runner = OnPolicyRunnerWithExtractor(
+            teacher_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
+        )
+        teacher_runner.load(str(args_cli.latency_teacher_checkpoint), load_optimizer=False)
+
+        from latency_bench.core.config import load_config
+
+        env = ParkourLatencyRslRlVecEnvWrapper(
+            env,
+            teacher_runner.alg.policy.actor,
+            load_config(args_cli.latency_config),
+            gamma=agent_cfg.algorithm.gamma,
+            clip_actions=agent_cfg.clip_actions,
+        )
+        agent_cfg.policy.actor.class_name = "CommandActor"
+        agent_cfg.policy.actor.action_horizon = 40
+        agent_cfg.policy.actor.command_dim = 34
+    else:
+        env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
@@ -201,8 +225,6 @@ def main():
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    # # close the simulator
-    env.close()
     rew_mean = statistics.mean(rewbuffer)
     rew_std = statistics.stdev(rewbuffer)
 
@@ -219,6 +241,7 @@ def main():
     print("Mean episode length: {:.2f}$\pm${:.2f}".format(len_mean, len_std))
     print("Mean number of waypoints: {:.2f}$\pm${:.2f}".format(num_waypoints_mean, num_waypoints_std))
     print("Mean edge violation: {:.2f}$\pm${:.2f}".format(edge_violation_mean, edge_violation_std))
+    env.close()
 
 if __name__ == "__main__":
     # run the main function
