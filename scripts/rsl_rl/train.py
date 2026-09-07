@@ -31,8 +31,6 @@ parser.add_argument(
 )
 parser.add_argument("--latency-config", type=Path, default=None)
 parser.add_argument("--latency-teacher-checkpoint", type=Path, default=None)
-parser.add_argument("--latency-action-horizon", type=int, default=40)
-parser.add_argument("--latency-control-repeat", type=int, default=5)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -174,8 +172,6 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     if args_cli.latency_config is not None:
-        if args_cli.latency_teacher_checkpoint is None:
-            raise ValueError("--latency-teacher-checkpoint is required with --latency-config")
         teacher_env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         teacher_runner = OnPolicyRunnerWithExtractor(
             teacher_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
@@ -190,14 +186,13 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
             env,
             decoder,
             latency_config,
-            action_horizon=args_cli.latency_action_horizon,
-            control_repeat=args_cli.latency_control_repeat,
+            control_repeat=latency_config["command"]["control_repeat"],
             gamma=agent_cfg.algorithm.gamma,
             clip_actions=agent_cfg.clip_actions,
         )
         agent_cfg.policy.actor.class_name = "CommandActor"
-        agent_cfg.policy.actor.action_horizon = args_cli.latency_action_horizon
-        agent_cfg.policy.actor.command_dim = 34
+        agent_cfg.policy.actor.action_horizon = latency_config["command"]["horizon"]
+        agent_cfg.policy.actor.command_dim = latency_config["command"]["dimension"]
     else:
         env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 

@@ -577,7 +577,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, load_optimizer: bool = True):
+    def load(self, path: str, load_optimizer: bool = True, load_latency_state: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
         self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         self.alg.estimator.load_state_dict(loaded_dict['estimator_state_dict'])
@@ -590,7 +590,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
             loading_teacher = not all(present_depth_keys)
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-        if "latency_state_dict" in loaded_dict and hasattr(self.env, "load_latency_state_dict"):
+        if load_latency_state and "latency_state_dict" in loaded_dict and hasattr(self.env, "load_latency_state_dict"):
             self.env.load_latency_state_dict(loaded_dict["latency_state_dict"])
         if self.empirical_normalization:
             if loading_teacher:

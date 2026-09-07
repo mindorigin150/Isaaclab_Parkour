@@ -52,7 +52,7 @@ class ParkourRslRlEstimatorCfg(ParkourRslRlBaseCfg):
 class ParkourRslRlActorCfg(ParkourRslRlBaseCfg):
     class_name: str = "Actor"
     state_history_encoder: ParkourRslRlStateHistEncoderCfg = MISSING
-    action_horizon: int = 40
+    action_horizon: int = 1
     command_dim: int = 34
 
 

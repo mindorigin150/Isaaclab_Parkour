@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from training.common.command_latency import CommandLatencyBatch
+from training.common.action_latency import ActionLatencyBatch
 
 from .vecenv_wrapper import ParkourRslRlVecEnvWrapper
 from parkour_isaaclab.actor import GO2_PARKOUR_YAW_SCALE
@@ -19,7 +19,6 @@ class ParkourLatencyRslRlVecEnvWrapper(ParkourRslRlVecEnvWrapper):
         decoder,
         latency_config: dict,
         *,
-        action_horizon: int = 40,
         control_repeat: int = 5,
         gamma: float = 0.99,
         clip_actions: float | None = None,
@@ -29,10 +28,9 @@ class ParkourLatencyRslRlVecEnvWrapper(ParkourRslRlVecEnvWrapper):
         self.decoder = decoder.eval().requires_grad_(False)
         self.control_repeat = control_repeat
         self.gamma = gamma
-        self.action_horizon = action_horizon
-        self.command_dim = 34
-        self.num_actions = self.command_dim * action_horizon
-        self._scheduler = CommandLatencyBatch(
+        self.command_dim = latency_config["command"]["dimension"]
+        self.num_actions = self.command_dim
+        self._scheduler = ActionLatencyBatch(
             latency_config,
             num_envs=self.num_envs,
             device=self.device,
@@ -41,21 +39,31 @@ class ParkourLatencyRslRlVecEnvWrapper(ParkourRslRlVecEnvWrapper):
         self._scheduler.reset()
         self._raw_obs, _ = self.get_observations()
 
-    def step(self, commands: torch.Tensor):
+    def step(self, commands: torch.Tensor, raw_step_budget: torch.Tensor | None = None):
         if self.clip_actions is not None:
             commands = torch.clamp(commands, -self.clip_actions, self.clip_actions)
-        commands = commands.reshape(self.num_envs, self.action_horizon, self.command_dim)
+        commands = commands.reshape(self.num_envs, self.command_dim)
+        if raw_step_budget is None:
+            raw_step_budget = torch.full(
+                (self.num_envs,), self.control_repeat, dtype=torch.long, device=self.device
+            )
+        else:
+            raw_step_budget = raw_step_budget.to(device=self.device, dtype=torch.long)
         reward = torch.zeros(self.num_envs, device=self.device)
+        raw_reward = torch.zeros(self.num_envs, device=self.device)
         dones = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         truncation = torch.zeros_like(dones)
         executed_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         terminal_obs = None
         extras = {}
-        active = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        active = raw_step_budget > 0
         active_ids = torch.nonzero(active, as_tuple=False).flatten()
         admission = self._scheduler.submit(commands, env_ids=active_ids.tolist())
         for raw_frame in range(self.control_repeat):
-            active_ids = torch.nonzero(active, as_tuple=False).flatten()
+            step_mask = active & (executed_steps < raw_step_budget)
+            active_ids = torch.nonzero(
+                step_mask, as_tuple=False
+            ).flatten()
             if not active_ids.numel():
                 break
             applied = self._scheduler.actions(env_ids=active_ids.tolist())
@@ -70,16 +78,17 @@ class ParkourLatencyRslRlVecEnvWrapper(ParkourRslRlVecEnvWrapper):
                     scandots_latent=latent,
                 )
             obs_dict, frame_reward, terminated, truncated, extras = self.unwrapped.step_no_reset(
-                motor_action, active_mask=active
+                motor_action, active_mask=step_mask
             )
             self._raw_obs = obs_dict["policy"]
             frame_done = terminated | truncated
             frame_discount = self.gamma**raw_frame
-            reward[active] += frame_discount * frame_reward[active]
-            executed_steps[active] += 1
-            dones[active] |= frame_done[active].to(torch.long)
-            truncation[active] |= truncated[active].to(torch.long)
-            newly_done = active & frame_done
+            reward[step_mask] += frame_discount * frame_reward[step_mask]
+            raw_reward[step_mask] += frame_reward[step_mask]
+            executed_steps[step_mask] += 1
+            dones[step_mask] |= frame_done[step_mask].to(torch.long)
+            truncation[step_mask] |= truncated[step_mask].to(torch.long)
+            newly_done = step_mask & frame_done
             if newly_done.any():
                 if terminal_obs is None:
                     terminal_obs = {key: value.clone() for key, value in obs_dict.items()}
@@ -91,11 +100,21 @@ class ParkourLatencyRslRlVecEnvWrapper(ParkourRslRlVecEnvWrapper):
         if terminal_obs is not None:
             extras["terminal_observations"] = terminal_obs
         extras["latency_executed_steps"] = executed_steps
+        extras["latency_raw_reward"] = raw_reward
+        extras["latency_active"] = raw_step_budget > 0
         extras["latency_discount"] = torch.pow(
             torch.full_like(executed_steps, self.gamma, dtype=torch.float32),
             executed_steps,
         )
         extras["latency_admission"] = admission
+        extras["latency_sampled_ms"] = torch.tensor(
+            [
+                float(submission["latency_ms"]) if submission is not None else float("nan")
+                for submission in self._scheduler.last_submission
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
         done_ids = torch.nonzero(dones.bool(), as_tuple=False).flatten().tolist()
         if done_ids:
             reset_obs, _ = self.unwrapped.reset(env_ids=torch.as_tensor(done_ids, device=self.device))

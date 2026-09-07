@@ -1,19 +1,21 @@
-"""Long-lived native PPO contract: admitted full chunks retain valid minibatch updates."""
+"""Long-lived native PPO contract: admitted commands retain valid minibatch updates."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from modules.actor_critic_with_encoder import ActorCriticRMA
 from modules.ppo_with_extractor import PPOWithExtractor
+from modules.on_policy_runner_with_extractor import OnPolicyRunnerWithExtractor
 
 
 @pytest.mark.parametrize("per_minibatch", [False, True])
-def test_admitted_chunk_updates_preserve_sample_alignment(per_minibatch):
+def test_admitted_commands_preserve_sample_alignment(per_minibatch):
     torch.manual_seed(7)
     policy = ActorCriticRMA(
-        num_critic_obs=753, num_actions=40 * 34,
+        num_critic_obs=753, num_actions=34,
         actor_hidden_dims=[16], critic_hidden_dims=[16],
         scan_encoder_dims=[32], priv_encoder_dims=[20],
         tanh_encoder_output=False, noise_std_type="log",
@@ -33,13 +35,13 @@ def test_admitted_chunk_updates_preserve_sample_alignment(per_minibatch):
         normalize_advantage_per_mini_batch=per_minibatch,
         priv_reg_coef_schedual=[0, 0, 0, 1],
     )
-    algorithm.init_storage("rl", 3, 2, [753], [753], [40 * 34])
+    algorithm.init_storage("rl", 3, 2, [753], [753], [34])
     before = policy.actor.actor_backbone[-1].weight.detach().clone()
     for _ in range(2):
         for _ in range(2):
             observation = torch.randn(3, 753)
             issued = algorithm.act(observation, observation)
-            assert issued.shape == (3, 40 * 34)
+            assert issued.shape == (3, 34)
             algorithm.process_env_step(
                 torch.tensor([1., 2., 3.]), torch.zeros(3, dtype=torch.bool),
                 {"latency_discount": torch.full((3,), 0.99),
@@ -50,3 +52,36 @@ def test_admitted_chunk_updates_preserve_sample_alignment(per_minibatch):
         assert all(math.isfinite(value) for value in losses.values())
         assert all(torch.isfinite(parameter).all() for parameter in policy.parameters())
     assert not torch.equal(before, policy.actor.actor_backbone[-1].weight)
+
+
+def test_inference_load_does_not_restore_latency_transport_state(tmp_path):
+    class Loader:
+        def load_state_dict(self, state):
+            self.state = state
+
+    class Env:
+        def __init__(self):
+            self.loaded = False
+
+        def load_latency_state_dict(self, state):
+            self.loaded = True
+
+    runner = object.__new__(OnPolicyRunnerWithExtractor)
+    runner.alg = SimpleNamespace(policy=Loader(), estimator=Loader(), rnd=None)
+    runner.depth_encoder_cfg = None
+    runner.empirical_normalization = False
+    runner.env = Env()
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "model_state_dict": {},
+            "estimator_state_dict": {},
+            "latency_state_dict": {"samplers": [], "episodes": []},
+            "infos": None,
+        },
+        checkpoint,
+    )
+
+    runner.load(str(checkpoint), load_optimizer=False, load_latency_state=False)
+
+    assert not runner.env.loaded

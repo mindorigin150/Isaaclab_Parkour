@@ -799,14 +799,14 @@ def _collect(env, actor, teacher_policy, checkpoint: Path) -> dict:
 
 def _collect_latency(env, command_policy, decoder_policy, checkpoint: Path) -> dict:
     # Isaac's app must be initialized before importing the tensor training adapter.
-    from training.common.command_latency import CommandLatencyBatch
+    from training.common.action_latency import ActionLatencyBatch
 
     config = load_config(args_cli.latency_config)
     output = args_cli.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     splits = ["train"] * args_cli.train_episodes + ["val"] * args_cli.val_episodes
     random.Random(args_cli.split_seed).shuffle(splits)
-    transport = CommandLatencyBatch(
+    transport = ActionLatencyBatch(
         config, num_envs=env.num_envs, device=env.device,
         noop_command=torch.zeros(PARKOUR_VLA_ACTION_DIM, device=env.device),
     )
