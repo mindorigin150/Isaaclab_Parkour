@@ -8,12 +8,12 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 import json
 import random
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -38,6 +38,8 @@ from latency_bench.core.latency_distribution import derive_seed
 from latency_bench.core.config import load_config
 from latency_bench.core.types import Action, Observation, StepResult
 from latency_bench.data.parkour_dagger import PARKOUR_ACTION_HORIZON
+from latency_bench.data.dagger import DaggerStep, collect_dagger
+from latency_bench.data.episode_io import encode_video
 from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
 from latency_bench.executors.env_step_backend import EnvStepResponse, RemoteEnvSlotHandle
 
@@ -501,79 +503,12 @@ def _masked_vla_state(state: np.ndarray) -> np.ndarray:
     return state
 
 
-def _predict_vla_outputs(
-    pool,
-    rgb: np.ndarray,
-    state: np.ndarray,
-    slots: list[int],
-    action_noise_seeds: Sequence[int],
-    step: int,
-) -> np.ndarray:
-    state = _masked_vla_state(state)
-
-    def predict_slots(worker_pool, worker_slots):
-        outputs_by_slot = {}
-        for start in range(0, len(worker_slots), args_cli.inference_batch_size):
-            batch_slots = worker_slots[start : start + args_cli.inference_batch_size]
-            outputs = worker_pool.predict_batch(
-                _policy_observations(
-                    rgb,
-                    state,
-                    batch_slots,
-                    action_noise_seeds,
-                    step,
-                )
-            )
-            outputs_by_slot.update(
-                (slot, np.asarray(output.action_chunk, dtype=np.float32))
-                for slot, output in zip(batch_slots, outputs)
-            )
-        return outputs_by_slot
-
-    if len(pool) == 1:
-        outputs_by_slot = predict_slots(pool[0], slots)
-    else:
-        slot_groups = [[] for _ in pool]
-        for slot in slots:
-            slot_groups[slot % len(pool)].append(slot)
-        with ThreadPoolExecutor(max_workers=len(pool)) as executor:
-            futures = [
-                executor.submit(predict_slots, worker_pool, worker_slots)
-                for worker_pool, worker_slots in zip(pool, slot_groups)
-            ]
-            outputs_by_slot = {}
-            for future in futures:
-                outputs_by_slot.update(future.result())
-    return np.stack([outputs_by_slot[slot] for slot in slots])
-
-
 def _new_policy_pool():
-    from latency_bench.core.config import load_config
     from latency_bench.executors.realtime.pool import ProcessInferencePool
 
     config = load_config(args_cli.policy_config)
-    devices = args_cli.inference_device
-    print(
-        f"[INFO]: Starting {len(devices)} official GR00T inference worker(s).",
-        flush=True,
-    )
-    pools = []
-    try:
-        for device in devices:
-            pools.append(
-                ProcessInferencePool(config=config, inference_devices=[device])
-            )
-    except BaseException:
-        for pool in pools:
-            pool.close()
-        raise
-    print("[INFO]: Official GR00T inference worker(s) ready.", flush=True)
-    return pools
-
-
-def _close_policy_pool(pool) -> None:
-    for worker_pool in pool:
-        worker_pool.close()
+    config["executor"]["inference_batch_size"] = args_cli.inference_batch_size
+    return ProcessInferencePool(config=config, inference_devices=args_cli.inference_device)
 
 
 def _summary(values: list[float]) -> dict[str, float]:
@@ -916,94 +851,141 @@ def _collect_latency(env, command_policy, decoder_policy, checkpoint: Path) -> d
 def _write_dagger_shard(
     output_dir: Path, shard_index: int, rows: list[dict], *, split: str = "train",
     control_trace: dict | None = None,
-) -> tuple[Path, Path]:
-    video_tmp = output_dir / f".dagger_shard_{shard_index:06d}.tmp.mp4"
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=".dagger_", dir=output_dir) as directory:
+        video_tmp = Path(directory) / "episode.mp4"
 
-    process = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgb24",
-            "-video_size",
-            f"{rows[0]['rgb'].shape[1]}x{rows[0]['rgb'].shape[0]}",
-            "-framerate",
-            "10",
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(video_tmp),
-        ],
-        stdin=subprocess.PIPE,
-    )
-    for row in rows:
-        process.stdin.write(np.asarray(row["rgb"], dtype=np.uint8).tobytes())
-    process.stdin.close()
-    return_code = process.wait()
-    if return_code:
-        raise subprocess.CalledProcessError(return_code, process.args)
+        encode_video([row["rgb"] for row in rows], video_tmp, fps=10, executable="ffmpeg")
 
-    payload = {
-        "state": np.stack(
-            [row["observation.state"] for row in rows]
-        ).astype(np.float32),
-        "action": np.stack([row["action"] for row in rows]).astype(np.float32),
-        "termination": np.stack([row["termination"] for row in rows]).astype(bool),
-        "actor_observation": np.stack(
-            [row["actor_observation"] for row in rows]
-        ).astype(np.float32),
-        "image_shape": np.asarray(rows[0]["rgb"].shape, dtype=np.int64),
-    }
-    if "raw_reward" in rows[0]:
-        payload["raw_reward"] = np.asarray(
-            [row["raw_reward"] for row in rows], dtype=np.float32
+        payload = {
+            "state": np.stack(
+                [row["observation.state"] for row in rows]
+            ).astype(np.float32),
+            "action": np.stack([row["action"] for row in rows]).astype(np.float32),
+            "termination": np.stack([row["termination"] for row in rows]).astype(bool),
+            "actor_observation": np.stack(
+                [row["actor_observation"] for row in rows]
+            ).astype(np.float32),
+            "image_shape": np.asarray(rows[0]["rgb"].shape, dtype=np.int64),
+        }
+        if "raw_reward" in rows[0]:
+            payload["raw_reward"] = np.asarray(
+                [row["raw_reward"] for row in rows], dtype=np.float32
+            )
+        if payload["action"].ndim == 3:
+            for field in ("episode_id", "obs_id", "issued_raw_frame", "ready_raw_frame", "latency_ms", "worker_id"):
+                payload[field] = np.asarray([row[field] for row in rows])
+        if control_trace is not None:
+            payload.update(control_trace)
+        # Keep the video-backed writer at the collection boundary so Isaac Lab can
+        # run without importing conversion-only dependencies.
+        from latency_bench.data.parkour_dagger import write_parkour_dagger_shard
+
+        write_parkour_dagger_shard(
+            output_dir,
+            split=split,
+            episode_idx=shard_index,
+            arrays=payload,
+            video_path=video_tmp,
         )
-    if payload["action"].ndim == 3:
-        for field in ("episode_id", "obs_id", "issued_raw_frame", "ready_raw_frame", "latency_ms", "worker_id"):
-            payload[field] = np.asarray([row[field] for row in rows])
-    if control_trace is not None:
-        payload.update(control_trace)
-    # Keep the video-backed writer at the collection boundary so Isaac Lab can
-    # run without importing conversion-only dependencies.
-    from latency_bench.data.parkour_dagger import write_parkour_dagger_shard
-
-    shard_dir = write_parkour_dagger_shard(
-        output_dir,
-        split=split,
-        episode_idx=shard_index,
-        arrays=payload,
-        video_path=video_tmp,
-    )
-    video_tmp.unlink()
-    return shard_dir / "episode.npz", shard_dir / "episode.mp4"
 
 
-def _existing_dagger_rows(output_dir: Path) -> tuple[int, int]:
+def _existing_dagger_rows(output_dir: Path) -> int:
     shard_dir = output_dir / "rollout_shards" / "train"
     row_count = 0
-    next_shard_id = 0
     for path in sorted(shard_dir.glob("episode_*")):
         if not path.is_dir():
             continue
         shard_path = path / "episode.npz"
         with np.load(shard_path) as shard:
             row_count += int(shard["state"].shape[0])
-        next_shard_id = max(next_shard_id, int(path.name.split("_")[-1]) + 1)
-    return row_count, next_shard_id
+    return row_count
+
+
+class ParkourDaggerAdapter:
+    """Retain native MTS, five-step teacher traces, and early-done padding."""
+
+    budget_mode = "anchor"
+    seed_mode = "slot"
+    reset = None
+
+    def __init__(self, env, actor, teacher_policy, output_dir):
+        self.inference_period = self.record_period = PARKOUR_VLA_CONTROL_REPEAT
+        self.env, self.actor, self.teacher_policy = env, actor, teacher_policy
+        self.output_dir = output_dir
+        self.num_envs = env.num_envs
+        self.shard_rows = args_cli.dagger_shard_rows
+        self.obs, _ = env.get_observations()
+        self.mts_prediction_count = self.mts_total_count = 0
+
+    def snapshot(self, due, record_slots):
+        actor_obs = self.obs.detach().cpu().numpy().copy()
+        return {
+            "state_cpu": actor_obs[:, :PARKOUR_VLA_PROPRIO_DIM],
+            "actor_obs": actor_obs,
+            "rgb": _rgb_frames(self.env) if due else None,
+        }
+
+    def observations(self, snapshot, slots, state):
+        return _policy_observations(
+            snapshot["rgb"], _masked_vla_state(snapshot["state_cpu"]), slots,
+            state.seeds, state.control_step,
+        )
+
+    def start_records(self, snapshot, slots, state):
+        with torch.inference_mode():
+            latent = self.actor.infer_scandots_latent(self.obs[slots]).cpu().numpy()
+        actions = np.concatenate(
+            (latent, snapshot["state_cpu"][slots, 6:8] / GO2_PARKOUR_YAW_SCALE), axis=1,
+        )
+        states = _masked_vla_state(snapshot["state_cpu"][slots])
+        return [
+            {"rgb": snapshot["rgb"][slot].copy(), "observation.state": value.copy(),
+             "action": action.copy(), "actor_observation": [], "termination": []}
+            for slot, value, action in zip(slots, states, actions, strict=True)
+        ]
+
+    def step(self, snapshot, active, state):
+        vla_action = torch.from_numpy(np.stack([
+            state.outputs[slot].action_chunk[
+                min(state.episode_steps[slot] % self.inference_period, args_cli.action_horizon - 1)
+            ]
+            for slot in active
+        ])).to(device=self.env.device, dtype=self.obs.dtype)
+        with torch.inference_mode():
+            actor_observation, use_prediction = apply_parkour_mts(
+                self.obs, vla_action[:, PARKOUR_VLA_LATENT_DIM:],
+            )
+            self.mts_prediction_count += use_prediction.sum().item()
+            self.mts_total_count += use_prediction.numel()
+            actions = self.teacher_policy(
+                actor_observation, hist_encoding=True,
+                scandots_latent=vla_action[:, :PARKOUR_VLA_LATENT_DIM],
+            )
+        self.obs, _, dones, _ = self.env.step(actions)
+        return DaggerStep(dones.bool().nonzero(as_tuple=False).flatten().cpu().tolist(), None)
+
+    def finish_record(self, row, snapshot, result, slot, finished):
+        row["actor_observation"].append(snapshot["actor_obs"][slot].copy())
+        terminated = slot in result.done
+        row["termination"].append(terminated)
+        if terminated:
+            while len(row["termination"]) < self.record_period:
+                row["actor_observation"].append(row["actor_observation"][-1].copy())
+                row["termination"].append(True)
+        if finished:
+            row["actor_observation"] = np.asarray(row["actor_observation"], dtype=np.float32)
+            row["termination"] = np.asarray(row["termination"], dtype=bool)
+
+    def write_rows(self, shard_index, slot, rows, writer):
+        rows[-1]["termination"][-1] = True
+        writer.submit(_write_dagger_shard, self.output_dir, shard_index, rows)
 
 
 def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
     output_dir = args_cli.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    row_count, shard_index = _existing_dagger_rows(output_dir)
+    row_count = _existing_dagger_rows(output_dir)
     target_rows = args_cli.dagger_row_budget
     if row_count >= target_rows:
         return {
@@ -1020,138 +1002,11 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
             "from an empty output directory."
         )
 
-    pool = _new_policy_pool()
-    obs, _ = env.get_observations()
-    num_envs = env.num_envs
-    all_ids = torch.arange(num_envs, device=env.device)
-    phase = torch.zeros(num_envs, dtype=torch.long, device=env.device)
-    action_chunk = torch.zeros(
-        (num_envs, args_cli.action_horizon, PARKOUR_VLA_ACTION_DIM),
-        dtype=obs.dtype,
-        device=env.device,
+    adapter = ParkourDaggerAdapter(env, actor, teacher_policy, output_dir)
+    row_count = collect_dagger(
+        adapter, _new_policy_pool(), row_budget=target_rows, seed=args_cli.seed,
+        is_running=simulation_app.is_running,
     )
-    all_slots = list(range(num_envs))
-    episode_rows: list[list[dict]] = [[] for _ in range(num_envs)]
-    episode_counts = [0] * num_envs
-    action_noise_seeds = [
-        derive_seed(args_cli.seed, vector_index=slot, episode_idx=0)
-        for slot in all_slots
-    ]
-    active_rows: list[dict | None] = [None] * num_envs
-    started_rows = row_count
-    completed_rows = row_count
-    control_step = 0
-    mts_prediction_count = 0
-    mts_total_count = 0
-
-    def flush_slot(slot: int) -> None:
-        nonlocal row_count, shard_index
-        rows = episode_rows[slot]
-        if not rows:
-            return
-        rows[-1]["termination"][-1] = True
-        _write_dagger_shard(output_dir, shard_index, rows)
-        row_count += len(rows)
-        shard_index += 1
-        episode_rows[slot] = []
-
-    try:
-        while completed_rows < target_rows and simulation_app.is_running():
-            state_cpu = obs[:, :PARKOUR_VLA_PROPRIO_DIM].detach().cpu().numpy()
-            due_ids = (phase == 0).nonzero(as_tuple=False).flatten()
-            due_slots = due_ids.cpu().tolist()
-            if due_slots:
-                rgb = _rgb_frames(env)
-                with torch.inference_mode():
-                    predicted = _predict_vla_outputs(
-                        pool,
-                        rgb,
-                        state_cpu,
-                        due_slots,
-                        action_noise_seeds,
-                        control_step,
-                    )
-                    action_chunk[due_ids] = torch.from_numpy(predicted).to(env.device)
-
-                    record_slots = due_slots[: target_rows - started_rows]
-                    if record_slots:
-                        record_ids = all_ids[record_slots]
-                        oracle_latent = actor.infer_scandots_latent(obs[record_ids])
-                        actions = np.concatenate(
-                            (
-                                oracle_latent.detach().cpu().numpy(),
-                                state_cpu[record_slots, 6:8] / GO2_PARKOUR_YAW_SCALE,
-                            ),
-                            axis=1,
-                        )
-                        states = _masked_vla_state(state_cpu[record_slots])
-                        for slot, state, action in zip(record_slots, states, actions):
-                            active_rows[slot] = {
-                                "rgb": rgb[slot],
-                                "observation.state": state,
-                                "action": action,
-                                "actor_observation": [],
-                                "termination": [],
-                            }
-                        started_rows += len(record_slots)
-
-            actor_observations = obs.detach().cpu().numpy()
-            for slot, row in enumerate(active_rows):
-                if row is not None:
-                    row["actor_observation"].append(actor_observations[slot].copy())
-
-            vla_action = action_chunk[all_ids, phase.clamp(max=args_cli.action_horizon - 1)]
-            latent = vla_action[:, :PARKOUR_VLA_LATENT_DIM]
-            predicted_yaw = vla_action[:, PARKOUR_VLA_LATENT_DIM :]
-            with torch.inference_mode():
-                actor_observation, use_prediction = apply_parkour_mts(obs, predicted_yaw)
-                mts_prediction_count += use_prediction.sum().item()
-                mts_total_count += use_prediction.numel()
-                actions = teacher_policy(
-                    actor_observation,
-                    hist_encoding=True,
-                    scandots_latent=latent,
-                )
-            obs, _, dones, _ = env.step(actions)
-
-            dones_cpu = dones.detach().cpu().numpy().astype(bool)
-            phase = (phase + 1) % PARKOUR_VLA_CONTROL_REPEAT
-            phase[dones.bool()] = 0
-            control_step += 1
-            for slot in np.flatnonzero(dones_cpu).tolist():
-                episode_counts[slot] += 1
-                action_noise_seeds[slot] = derive_seed(
-                    args_cli.seed,
-                    vector_index=slot,
-                    episode_idx=episode_counts[slot],
-                )
-
-            for slot, row in enumerate(active_rows):
-                if row is None:
-                    continue
-                terminated = bool(dones_cpu[slot])
-                row["termination"].append(terminated)
-                if terminated:
-                    while len(row["termination"]) < PARKOUR_VLA_CONTROL_REPEAT:
-                        row["actor_observation"].append(
-                            row["actor_observation"][-1].copy()
-                        )
-                        row["termination"].append(True)
-                if terminated or phase[slot] == 0:
-                    row["actor_observation"] = np.asarray(
-                        row["actor_observation"], dtype=np.float32
-                    )
-                    row["termination"] = np.asarray(row["termination"], dtype=bool)
-                    episode_rows[slot].append(row)
-                    active_rows[slot] = None
-                    completed_rows += 1
-                    if terminated or len(episode_rows[slot]) == args_cli.dagger_shard_rows:
-                        flush_slot(slot)
-
-    finally:
-        for slot in all_slots:
-            flush_slot(slot)
-        _close_policy_pool(pool)
 
     metadata = {
         "schema_version": 6,
@@ -1191,7 +1046,7 @@ def _collect_dagger(env, actor, teacher_policy, checkpoint: Path) -> dict:
         "failure_and_timeout_rows_retained": True,
         "state_yaw_indices_masked": [6, 7],
         "dagger_mts_threshold_rad": GO2_PARKOUR_MTS_THRESHOLD_RAD,
-        "dagger_mts_prediction_fraction": mts_prediction_count / mts_total_count,
+        "dagger_mts_prediction_fraction": adapter.mts_prediction_count / adapter.mts_total_count,
     }
     temporary = output_dir / "metadata.json.tmp"
     with temporary.open("w", encoding="utf-8") as handle:

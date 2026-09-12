@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -460,49 +461,17 @@ def test_rgb_frames_restores_visibility_and_composites_only_own_robot_pixels():
     assert [attribute.values for attribute in attributes] == [[False, True]]
 
 
-def test_multi_pool_prediction_keeps_slot_affinity_and_request_order():
+def test_dagger_observations_keep_request_order_and_episode_noise_seeds():
+    """Native observation contract; worker affinity/batching belongs to ProcessInferencePool."""
     module = _load_parkour_vla_module()
-    module.PARKOUR_VLA_PROPRIO_DIM = 53
-    module.args_cli.inference_batch_size = 2
-
-    class Pool:
-        def __init__(self, worker_id):
-            self.worker_id = worker_id
-            self.slots = []
-
-        def predict_batch(self, observations):
-            slots = [item.metadata["slot_id"] for item in observations]
-            assert all(slot % 2 == self.worker_id for slot in slots)
-            assert [item.metadata["action_noise_seed"] for item in observations] == [
-                100 + slot for slot in slots
-            ]
-            self.slots.extend(slots)
-            if self.worker_id == 0:
-                time.sleep(0.01)
-            return [
-                SimpleNamespace(
-                    action_chunk=np.full((40, 34), slot, dtype=np.float32)
-                )
-                for slot in slots
-            ]
-
-    pools = [Pool(0), Pool(1)]
-    rgb = np.zeros((8, 1, 1, 3), dtype=np.uint8)
-    state = np.zeros((8, 53), dtype=np.float32)
-
-    episode_seeds = list(range(100, 108))
-    output = module._predict_vla_outputs(
-        pools, rgb, state, [7, 2, 5, 0], episode_seeds, 10
+    observations = module._policy_observations(
+        np.zeros((8, 1, 1, 3), dtype=np.uint8), np.zeros((8, 53), dtype=np.float32),
+        [7, 2, 5, 0], list(range(100, 108)), 10,
     )
-    reset_output = module._predict_vla_outputs(
-        pools, rgb, state, [2, 7], episode_seeds, 11
-    )
+    assert [item.metadata["slot_id"] for item in observations] == [7, 2, 5, 0]
+    assert [item.metadata["action_noise_seed"] for item in observations] == [107, 102, 105, 100]
+    assert all(item.env_step == 10 and item.sim_time_ms == 200 for item in observations)
 
-    assert output.shape == (4, 40, 34)
-    np.testing.assert_array_equal(output[:, 0, 0], [7, 2, 5, 0])
-    np.testing.assert_array_equal(reset_output[:, 0, 0], [2, 7])
-    assert pools[0].slots == [2, 0, 2]
-    assert pools[1].slots == [7, 5, 7]
 
 
 def test_latency_backend_uses_no_reset_step_and_preserves_edge_moments():
@@ -642,7 +611,8 @@ def test_latency_backend_leaves_completed_slots_inactive():
     assert raw.seen_actions[1][1, 0] == 2
 
 
-def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_path):
+@pytest.mark.parametrize("horizon", [1, 40])
+def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_path, horizon):
     module = _load_parkour_vla_module()
     module.args_cli.output_dir = tmp_path / "dagger"
     module.args_cli.dagger_row_budget = 4
@@ -656,7 +626,6 @@ def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_pat
     module.PARKOUR_VLA_PROPRIO_DIM = 53
     module.PARKOUR_VLA_PROMPT = "parkour"
     module.simulation_app = SimpleNamespace(is_running=lambda: True)
-    module._new_policy_pool = lambda: [SimpleNamespace(close=lambda: None)]
     module._rgb_frames = lambda env: np.zeros((env.num_envs, 1, 1, 3))
     module.apply_parkour_mts = lambda obs, yaw: (
         obs,
@@ -667,12 +636,14 @@ def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_pat
         lambda output, index, rows, **kwargs: written.append(rows)
     )
 
-    def predict(pool, rgb, state, slots, episode_seeds, step):
-        chunk = np.zeros((len(slots), 40, 34), dtype=np.float32)
-        chunk[:, :, 0] = np.arange(40)
-        return chunk
+    module.args_cli.action_horizon = horizon
 
-    module._predict_vla_outputs = predict
+    def predict(observations):
+        chunk = np.zeros((len(observations), horizon, 34), dtype=np.float32)
+        chunk[:, :, 0] = np.arange(horizon)
+        return [SimpleNamespace(action_chunk=action) for action in chunk]
+
+    module._new_policy_pool = lambda: SimpleNamespace(predict_batch=predict, close=lambda: None)
     executed = []
 
     class Env:
@@ -681,11 +652,12 @@ def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_pat
 
         def __init__(self):
             self.elapsed = torch.zeros(2, dtype=torch.long)
+            self.obs = torch.zeros((2, 753))
 
         def observations(self):
-            obs = torch.zeros((2, 753))
-            obs[:, 0] = torch.arange(2)
-            return obs
+            self.obs[:, 0] = torch.arange(2)
+            self.obs[:, 1] = self.elapsed
+            return self.obs
 
         def get_observations(self):
             return self.observations(), {}
@@ -707,10 +679,11 @@ def test_dagger_chunks_are_consumed_in_order_and_shards_do_not_mix_slots(tmp_pat
 
     assert result["schema_version"] == 6
     assert result["rows"] == 4
-    assert executed[:6] == [0.0, 1.0, 2.0, 3.0, 4.0, 0.0]
+    assert executed[:6] == ([0.0] * 6 if horizon == 1 else [0.0, 1.0, 2.0, 3.0, 4.0, 0.0])
     assert sorted(len(rows) for rows in written) == [2, 2]
     for rows in written:
         assert len({float(row["observation.state"][0]) for row in rows}) == 1
         assert all(row["actor_observation"].shape == (5, 753) for row in rows)
         assert all(row["termination"].shape == (5,) for row in rows)
         assert rows[-1]["termination"][-1]
+        np.testing.assert_array_equal(rows[0]["actor_observation"][:, 1], [0, 1, 2, 3, 4])
