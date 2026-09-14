@@ -30,7 +30,10 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--latency-config", type=Path, default=None)
-parser.add_argument("--latency-teacher-checkpoint", type=Path, default=None)
+parser.add_argument(
+    "--latency-teacher-checkpoint", type=Path, default=None,
+    help="Frozen motor decoder checkpoint; trainable policy starts with random weights.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -93,6 +96,9 @@ from scripts.rsl_rl.vecenv_wrapper import ParkourRslRlVecEnvWrapper
 if str(Path(__file__).resolve().parents[4]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from scripts.rsl_rl.latency_vecenv import ParkourLatencyRslRlVecEnvWrapper
+from parkour_isaaclab.actor import Actor
+from rsl_rl.utils import resolve_nn_activation
+from latency_bench.core.config import load_config
 # import isaaclab_tasks  # noqa: F401
 import parkour_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -172,14 +178,23 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     if args_cli.latency_config is not None:
-        teacher_env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-        teacher_runner = OnPolicyRunnerWithExtractor(
-            teacher_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
-        )
-        teacher_runner.load(str(args_cli.latency_teacher_checkpoint), load_optimizer=False)
-        decoder = teacher_runner.alg.policy.actor
-
-        from latency_bench.core.config import load_config
+        decoder_cfg = agent_cfg.policy.actor.to_dict()
+        decoder_cfg.pop("class_name")
+        decoder = Actor(
+            env.unwrapped.action_manager.total_action_dim,
+            agent_cfg.policy.scan_encoder_dims,
+            agent_cfg.policy.actor_hidden_dims,
+            agent_cfg.policy.priv_encoder_dims,
+            resolve_nn_activation(agent_cfg.policy.activation),
+            tanh_encoder_output=agent_cfg.policy.tanh_encoder_output,
+            **decoder_cfg,
+        ).to(agent_cfg.device)
+        teacher_state = torch.load(
+            args_cli.latency_teacher_checkpoint, map_location=agent_cfg.device, weights_only=False
+        )["model_state_dict"]
+        decoder.load_state_dict({name: teacher_state[f"actor.{name}"] for name in decoder.state_dict()})
+        del teacher_state
+        print(f"[INFO] Random latency policy; frozen decoder: {args_cli.latency_teacher_checkpoint}")
 
         latency_config = load_config(args_cli.latency_config)
         env = ParkourLatencyRslRlVecEnvWrapper(
@@ -198,15 +213,6 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
 
     # create runner from the native RSL-RL implementation
     runner = OnPolicyRunnerWithExtractor(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    if args_cli.latency_config is not None:
-        teacher_state = teacher_runner.alg.policy.actor.state_dict()
-        command_actor = runner.alg.policy.actor
-        own_state = command_actor.state_dict()
-        output_head = f"actor_backbone.{len(command_actor.actor_backbone) - 1}."
-        for name, value in teacher_state.items():
-            if not name.startswith(output_head):
-                own_state[name].copy_(value)
-        command_actor.load_state_dict(own_state)
     # # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint

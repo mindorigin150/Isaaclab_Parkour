@@ -8,15 +8,12 @@ from parkour_isaaclab.actor import Actor, GO2_PARKOUR_YAW_SCALE
 
 
 class CommandActor(Actor):
-    """Predict one latent+yaw command from the teacher feature modules."""
+    """Predict latent+yaw commands with randomly initialized feature modules."""
 
     def __init__(self, num_actions, *args, action_horizon: int = 1, command_dim: int = 34, **kwargs):
         self.action_horizon = action_horizon
         self.command_dim = command_dim
         super().__init__(action_horizon * command_dim, *args, **kwargs)
-        last = self.actor_backbone[-1]
-        torch.nn.init.zeros_(last.weight)
-        torch.nn.init.zeros_(last.bias)
 
     def forward(self, obs, hist_encoding: bool, scandots_latent=None):
         if self.if_scan_encode:

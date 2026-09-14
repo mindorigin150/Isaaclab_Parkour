@@ -37,6 +37,7 @@ def test_admitted_commands_preserve_sample_alignment(per_minibatch):
     )
     algorithm.init_storage("rl", 3, 2, [753], [753], [34])
     before = policy.actor.actor_backbone[-1].weight.detach().clone()
+    assert torch.count_nonzero(before) > 0
     for _ in range(2):
         for _ in range(2):
             observation = torch.randn(3, 753)
