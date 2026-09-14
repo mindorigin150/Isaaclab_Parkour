@@ -46,9 +46,8 @@ class UniformParkourCommand(CommandTerm):
         if active_mask is None:
             return super().compute(dt)
         self._update_metrics(active_mask)
-        self.time_left[active_mask] -= dt
-        resample_env_ids = (self.time_left <= 0.0).nonzero().flatten()
-        resample_env_ids = resample_env_ids[active_mask[resample_env_ids]]
+        torch.where(active_mask, self.time_left - dt, self.time_left, out=self.time_left)
+        resample_env_ids = ((self.time_left <= 0.0) & active_mask).nonzero().flatten()
         if len(resample_env_ids) > 0:
             self._resample(resample_env_ids)
         self._update_command(active_mask)
@@ -68,8 +67,10 @@ class UniformParkourCommand(CommandTerm):
             self.metrics["error_vel_xy"] += values_xy
             self.metrics["error_vel_yaw"] += values_yaw
         else:
-            self.metrics["error_vel_xy"][active_mask] += values_xy[active_mask]
-            self.metrics["error_vel_yaw"][active_mask] += values_yaw[active_mask]
+            error_xy = self.metrics["error_vel_xy"]
+            error_yaw = self.metrics["error_vel_yaw"]
+            torch.where(active_mask, error_xy + values_xy, error_xy, out=error_xy)
+            torch.where(active_mask, error_yaw + values_yaw, error_yaw, out=error_yaw)
 
     def _resample_command(self, env_ids: Sequence[int]):
         # sample velocity commands
@@ -94,7 +95,8 @@ class UniformParkourCommand(CommandTerm):
         if active_mask is None:
             self.vel_command_b[:, 2] = angular_command
         else:
-            self.vel_command_b[active_mask, 2] = angular_command[active_mask]
+            yaw = self.vel_command_b[:, 2]
+            torch.where(active_mask, angular_command, yaw, out=yaw)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:

@@ -116,12 +116,11 @@ class ExtremeParkourObservations(ManagerTermBase):
         active_mask = env._latency_eval_active_mask
         if active_mask is None:
             active_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
-        self._obs_history_buffer[active_mask, :-1] = self._obs_history_buffer[
-            active_mask, 1:
-        ].clone()
-        self._obs_history_buffer[active_mask, -1] = obs_buf[active_mask]
+        history = self._obs_history_buffer
+        history[:, :-1] = torch.where(active_mask[:, None, None], history[:, 1:], history[:, :-1])
+        torch.where(active_mask[:, None], obs_buf, history[:, -1], out=history[:, -1])
         reset_mask = active_mask & (env.episode_length_buf <= 1)
-        self._obs_history_buffer[reset_mask] = obs_buf[reset_mask].unsqueeze(1)
+        torch.where(reset_mask[:, None, None], obs_buf[:, None], history, out=history)
         return observations 
 
     def _get_contact_fill(

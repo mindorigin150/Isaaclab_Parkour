@@ -1,6 +1,10 @@
 """Long-lived native PPO contract: admitted commands retain valid minibatch updates."""
 
 import math
+import importlib.util
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +13,7 @@ import torch
 from modules.actor_critic_with_encoder import ActorCriticRMA
 from modules.ppo_with_extractor import PPOWithExtractor
 from modules.on_policy_runner_with_extractor import OnPolicyRunnerWithExtractor
+from training.common.action_latency import ActionLatencyBatch
 
 
 @pytest.mark.parametrize("per_minibatch", [False, True])
@@ -86,3 +91,101 @@ def test_inference_load_does_not_restore_latency_transport_state(tmp_path):
     runner.load(str(checkpoint), load_optimizer=False, load_latency_state=False)
 
     assert not runner.env.loaded
+
+
+@pytest.mark.parametrize(("budget", "end_steps"), [
+    (None, [1, 3, 100]),
+    ([5, 5, 2], [1, 3, 100]),
+    ([0, 5, 2], [1, 3, 100]),
+    (None, [3, 1, 2]),
+    (None, [100, 100, 100]),
+])
+def test_latency_step_preserves_partial_budgets_and_terminal_bootstrap(budget, end_steps, monkeypatch):
+    """Native adapter contract: rewards and terminal states stop at each slot's last step."""
+    package = types.ModuleType("latency_adapter_test")
+    package.__path__ = []
+    base = types.ModuleType("latency_adapter_test.vecenv_wrapper")
+    base.ParkourRslRlVecEnvWrapper = type("Base", (), {
+        "unwrapped": property(lambda self: self.env),
+    })
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setitem(sys.modules, base.__name__, base)
+    path = Path(__file__).parents[1] / "scripts/rsl_rl/latency_vecenv.py"
+    spec = importlib.util.spec_from_file_location("latency_adapter_test.wrapper", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Env:
+        cfg = SimpleNamespace(is_finite_horizon=False)
+
+        def __init__(self):
+            self.elapsed = torch.zeros(3, dtype=torch.long)
+
+        def observations(self):
+            return {"policy": self.elapsed[:, None].expand(3, 53).float().clone()}
+
+        def step_no_reset(self, action, active_mask):
+            self.elapsed += active_mask
+            ended = self.elapsed == torch.tensor(end_steps)
+            terminated = ended & torch.tensor([False, True, True])
+            truncated = ended & torch.tensor([True, False, False])
+            reward = torch.where(active_mask, self.elapsed.float(), float("nan"))
+            return self.observations(), reward, terminated, truncated, {}
+
+        def reset(self, env_ids):
+            self.reset_ids = env_ids.tolist()
+            self.elapsed[env_ids] = 0
+            return self.observations(), {}
+
+    class Decoder(torch.nn.Module):
+        def forward(self, observation, **kwargs):
+            return torch.zeros(3, 12)
+
+    config = {
+        "env": {"env_fps": 50, "obs_fps": 10},
+        "latency": {"method": "fixed", "fixed_latency_ms": 0, "seed": 0},
+        "executor": {"simulated_worker_capacity": 1},
+        "scheduler": {"ordering_policy": "latest_ready", "hold_policy": "hold"},
+    }
+    wrapper = object.__new__(module.ParkourLatencyRslRlVecEnvWrapper)
+    wrapper.env = Env()
+    wrapper.num_envs = 3
+    wrapper.device = "cpu"
+    wrapper.command_dim = 34
+    wrapper.control_repeat = 5
+    wrapper.gamma = 0.5
+    wrapper.clip_actions = None
+    wrapper.decoder = Decoder()
+    wrapper._raw_obs = torch.zeros(3, 53)
+    wrapper._actor_obs = torch.empty_like(wrapper._raw_obs)
+    wrapper._raw_step_budget = torch.full((3,), 5, dtype=torch.long)
+    wrapper._gamma = torch.full((3,), 0.5)
+    wrapper._scheduler = ActionLatencyBatch(config, num_envs=3, device="cpu", noop_command=torch.zeros(34))
+    wrapper._scheduler.reset()
+    raw_budget = None if budget is None else torch.tensor(budget)
+    observation, reward, done, info = wrapper.step(torch.ones(3, 34), raw_budget)
+    budgets = [5, 5, 5] if budget is None else budget
+    executed = [min(5, available, end) for available, end in zip(budgets, end_steps)]
+    ended = [count == end for count, end in zip(executed, end_steps)]
+    torch.testing.assert_close(info["latency_executed_steps"], torch.tensor(executed))
+    torch.testing.assert_close(reward, torch.tensor([
+        sum((i + 1) * 0.5**i for i in range(count)) for count in executed
+    ]))
+    torch.testing.assert_close(info["latency_raw_reward"], torch.tensor([
+        float(sum(range(1, count + 1))) for count in executed
+    ]))
+    torch.testing.assert_close(info["latency_discount"], torch.tensor([0.5**count for count in executed]))
+    assert done.tolist() == ended
+    assert info["time_outs"].tolist() == [ended[0], False, False]
+    assert info["latency_admission"].tolist() == [available > 0 for available in budgets]
+    if any(ended):
+        for slot, is_done in enumerate(ended):
+            if is_done:
+                assert info["terminal_observations"]["policy"][slot, 0] == executed[slot]
+        assert wrapper.env.reset_ids == [slot for slot, is_done in enumerate(ended) if is_done]
+    else:
+        assert "terminal_observations" not in info
+    assert observation[:, 0].tolist() == [0 if is_done else count for count, is_done in zip(executed, ended)]
+    assert wrapper._scheduler.episodes == [
+        3 + sum(ended[:slot]) if is_done else slot for slot, is_done in enumerate(ended)
+    ]

@@ -72,7 +72,10 @@ class ParkourEvent(ParkourTerm):
             terrain_generator.terrain_names[:, :, -1] == 'parkour_flat'
         ).to(self.device)
         self.flat_terrain_mask = self._terrain_flat_mask[self.terrain.terrain_levels, self.terrain.terrain_types]
-        self._reset_offset = self.env.event_manager.get_term_cfg('reset_root_state').params['offset']
+        reset_offset = self.env.event_manager.get_term_cfg('reset_root_state').params['offset']
+        self._start_offset = torch.tensor(
+            (self.terrain.cfg.terrain_generator.size[1] + reset_offset, 0), device=self.device
+        )
 
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
         self.target_pos_rel = self.cur_goals[:, :2] - robot_root_pos_w
@@ -106,15 +109,16 @@ class ParkourEvent(ParkourTerm):
             ).squeeze(-1)
             if tmp_mask.numel() > 0:
                 self.future_goal_idx[tmp_mask, self.cur_goal_idx[tmp_mask]] = False
-        self.cur_goal_idx[next_flag] += 1
-        self.reach_goal_timer[next_flag] = 0
+        self.cur_goal_idx += next_flag
+        self.reach_goal_timer.masked_fill_(next_flag, 0)
         robot_root_pos_w = self.robot.data.root_pos_w[:, :2] - self.env_origins[:, :2]
         self.reached_goal_ids = torch.norm(robot_root_pos_w - self.cur_goals[:, :2], dim=1) < self.next_goal_threshold
         if active_mask is not None:
             self.reached_goal_ids &= active_mask
-        reached_goal_idx = self.reached_goal_ids.nonzero(as_tuple=False).squeeze(-1)
-        if reached_goal_idx.numel() > 0:
-            self.reach_goal_timer[reached_goal_idx] += 1
+        torch.where(
+            self.reached_goal_ids, self.reach_goal_timer + 1, self.reach_goal_timer,
+            out=self.reach_goal_timer,
+        )
 
         self.target_pos_rel = self.cur_goals[:, :2] - robot_root_pos_w
         self.next_target_pos_rel = self.next_goals[:, :2] - robot_root_pos_w
@@ -127,9 +131,7 @@ class ParkourEvent(ParkourTerm):
         self.next_target_yaw = torch.atan2(target_vec_norm[:, 1], target_vec_norm[:, 0])
         self.cur_goals = self._gather_cur_goals()
         self.next_goals = self._gather_cur_goals(future=1)
-        start_pos = self.env_origins[:,:2] - \
-                    torch.tensor((self.terrain.cfg.terrain_generator.size[1] + \
-                                  self._reset_offset, 0)).to(self.device)
+        start_pos = self.env_origins[:, :2] - self._start_offset
 
         self.dis_to_start_pos = torch.norm(start_pos - self.robot.data.root_pos_w[:, :2], dim=1)
 
@@ -137,9 +139,7 @@ class ParkourEvent(ParkourTerm):
         ## we are use reset_root_state events for initalize robot position in a subterrain
         ## original robot root init position is (0,0) in the subterrain axis, so we subtracted off from current robot position 
 
-        start_pos = self.env_origins[env_ids,:2] - \
-                    torch.tensor((self.terrain.cfg.terrain_generator.size[1] + \
-                                  self._reset_offset, 0)).to(self.device)
+        start_pos = self.env_origins[env_ids, :2] - self._start_offset
 
         self.dis_to_start_pos = torch.norm(start_pos - self.robot.data.root_pos_w[env_ids, :2], dim=1)
 
@@ -196,10 +196,14 @@ class ParkourEvent(ParkourTerm):
             self.metrics["current_goal_idx"].copy_(current_goal_idx)
             self.metrics["how_far_from_start_point"].copy_(self.dis_to_start_pos)
         else:
-            self.metrics["terrain_levels"][active_mask] = terrain_levels[active_mask]
-            self.metrics["far_from_current_goal"][active_mask] = far_from_goal[active_mask]
-            self.metrics["current_goal_idx"][active_mask] = current_goal_idx[active_mask]
-            self.metrics["how_far_from_start_point"][active_mask] = self.dis_to_start_pos[active_mask]
+            for name, value in (
+                ("terrain_levels", terrain_levels),
+                ("far_from_current_goal", far_from_goal),
+                ("current_goal_idx", current_goal_idx),
+                ("how_far_from_start_point", self.dis_to_start_pos),
+            ):
+                metric = self.metrics[name]
+                torch.where(active_mask, value, metric, out=metric)
         
     def _set_debug_vis_impl(self, debug_vis: bool):
         # create markers if necessary for the first tome

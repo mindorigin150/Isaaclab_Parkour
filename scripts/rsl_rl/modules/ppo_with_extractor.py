@@ -576,19 +576,20 @@ class PPOWithExtractor(PPO):
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_entropy += entropy_loss.item()
-            mean_priv_reg_loss += priv_reg_loss.mean().item()
-            mean_estimator_loss += estimator_loss.item()
-            mean_admitted_count += admission_batch.sum().item() / num_aug
+            # Match Python scalar summation precision without per-minibatch readbacks.
+            mean_value_loss += value_loss.detach().to(torch.float64)
+            mean_surrogate_loss += surrogate_loss.detach().to(torch.float64)
+            mean_entropy += entropy_loss.detach().to(torch.float64)
+            mean_priv_reg_loss += priv_reg_loss.detach().to(torch.float64)
+            mean_estimator_loss += estimator_loss.detach().to(torch.float64)
+            mean_admitted_count += admission_batch.sum().to(torch.float64) / num_aug
 
             # -- RND loss
             if mean_rnd_loss is not None:
-                mean_rnd_loss += rnd_loss.item()
+                mean_rnd_loss += rnd_loss.detach().to(torch.float64)
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+                mean_symmetry_loss += symmetry_loss.detach().to(torch.float64)
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -612,13 +613,14 @@ class PPOWithExtractor(PPO):
             "entropy": mean_entropy,
             'estimator':mean_estimator_loss,
             'admitted_count': mean_admitted_count,
-            'priv_reg_coef': priv_reg_coef
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        return loss_dict
+        names = tuple(loss_dict)
+        values = torch.stack(tuple(loss_dict.values())).cpu().tolist()
+        return dict(zip(names, values)) | {"priv_reg_coef": priv_reg_coef}
 
     def update_counter(self):
         self.counter += 1

@@ -7,6 +7,7 @@
 
 """Launch Isaac Sim Simulator first."""
 import os 
+import gc
 import argparse
 import sys
 from pathlib import Path
@@ -208,6 +209,8 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         agent_cfg.policy.actor.class_name = "CommandActor"
         agent_cfg.policy.actor.action_horizon = latency_config["command"]["horizon"]
         agent_cfg.policy.actor.command_dim = latency_config["command"]["dimension"]
+        # Avoid frequent full scans of thousands of long-lived replica objects.
+        gc.set_threshold(100000, 10, 10)
     else:
         env = ParkourRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 

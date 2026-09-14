@@ -144,7 +144,7 @@ class ParkourManagerBasedRLEnv(ParkourManagerBasedEnv, gym.Env):
             self.parkour_manager.compute(dt=self.step_dt, active_mask=active_mask)
             # post-step:
             # -- update env counters (used for curriculum generation)
-            self.episode_length_buf[active_mask] += 1  # step in current episode (per env)
+            self.episode_length_buf += active_mask
             self.common_step_counter += 1  # total step (common for all envs)
             # -- check terminations
             previous_term_dones = {
@@ -152,18 +152,20 @@ class ParkourManagerBasedRLEnv(ParkourManagerBasedEnv, gym.Env):
                 for name in self.termination_manager.active_terms
             }
             self.reset_buf = self.termination_manager.compute()
-            self.reset_buf[~active_mask] = False
+            self.reset_buf.logical_and_(active_mask)
             for name, previous in previous_term_dones.items():
-                self.termination_manager.get_term(name)[~active_mask] = previous[~active_mask]
+                term = self.termination_manager.get_term(name)
+                torch.where(active_mask, term, previous, out=term)
             self.reset_terminated = self.termination_manager.terminated
             self.reset_time_outs = self.termination_manager.time_outs
-            self.reset_terminated[~active_mask] = False
-            self.reset_time_outs[~active_mask] = False
+            self.reset_terminated.logical_and_(active_mask)
+            self.reset_time_outs.logical_and_(active_mask)
 
             # -- reward computation
-            reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+            if reset_done:
+                reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
             self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
-            self.reward_buf[~active_mask] = 0.0
+            self.reward_buf.masked_fill_(~active_mask, 0.0)
 
             if len(self.recorder_manager.active_terms) > 0:
                 # update observations for recording if needed
