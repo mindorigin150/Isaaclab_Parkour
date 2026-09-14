@@ -784,6 +784,7 @@ def _collect_latency(env, command_policy, decoder_policy, checkpoint: Path) -> d
         for slot in range(env.num_envs):
             actor_inputs[slot].append(before_step[slot].copy())
         applied = transport.actions()
+        applications = transport.last_application
         applied_cpu = applied.cpu().numpy()
         motor_actions = _parkour_actor_action(env, decoder_policy, obs, applied)
         obs_dict, rewards, terminated, truncated, _ = env.unwrapped.step_no_reset(motor_actions)
@@ -795,7 +796,7 @@ def _collect_latency(env, command_policy, decoder_policy, checkpoint: Path) -> d
             rows[slot][-1]["raw_reward"] += rewards[slot].item()
             control_traces[slot].append({
                 "applied_command": applied_cpu[slot].copy(),
-                **transport.last_application[slot],
+                **applications[slot],
                 "reward": rewards[slot].item(), "done": done[slot].item(),
             })
         transport.advance()
