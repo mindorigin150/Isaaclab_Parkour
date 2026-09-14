@@ -1,4 +1,4 @@
-"""Long-lived native PPO contract: admitted commands retain valid minibatch updates."""
+"""Long-lived native PPO contracts for command admission, transport, and logging."""
 
 import math
 import importlib.util
@@ -14,6 +14,99 @@ from modules.actor_critic_with_encoder import ActorCriticRMA
 from modules.ppo_with_extractor import PPOWithExtractor
 from modules.on_policy_runner_with_extractor import OnPolicyRunnerWithExtractor
 from training.common.action_latency import ActionLatencyBatch
+
+
+def test_runner_logs_control_steps_and_undiscounted_episode_rewards(tmp_path, monkeypatch):
+    """Long-lived logging contract: sample clocks and episode metrics match teacher units."""
+    observation = torch.zeros(2, 1)
+    steps = iter([torch.tensor([5, 2]), torch.tensor([1, 3])])
+    raw_rewards = iter([torch.tensor([10., 20.]), torch.tensor([30., 40.])])
+    rewards = iter([torch.tensor([1., 2.]), torch.tensor([3., 4.])])
+    dones = iter([torch.tensor([0, 0]), torch.tensor([1, 1])])
+    processed_rewards = []
+    other_rank_steps = iter([5, 7])
+    metrics = {}
+
+    class Env:
+        num_envs = 2
+        device = "cpu"
+
+        def get_observations(self):
+            return observation, {"observations": {"policy": observation}}
+
+        def step(self, actions):
+            return observation, next(rewards), next(dones), {
+                "observations": {"policy": observation},
+                "latency_executed_steps": next(steps),
+                "latency_raw_reward": next(raw_rewards),
+            }
+
+    class Writer:
+        def add_scalar(self, tag, value, step):
+            metrics[tag] = value
+
+    def all_reduce(value):
+        value += next(other_rank_steps)
+
+    runner = object.__new__(OnPolicyRunnerWithExtractor)
+    runner.alg = SimpleNamespace(
+        policy=SimpleNamespace(action_std=torch.ones(2)), rnd=None, learning_rate=1e-4,
+        act=lambda *args: torch.zeros(2, 34),
+        process_env_step=lambda reward, *args: processed_rewards.append(reward.clone()),
+        compute_returns=lambda *args: None,
+        update=lambda: {"value_function": 0.}, update_dagger=lambda: 0.,
+        broadcast_parameters=lambda: None,
+    )
+    runner.env = Env()
+    runner.device = "cpu"
+    runner.training_type = "rl"
+    runner.writer = Writer()
+    runner.log_dir = str(tmp_path)
+    runner.logger_type = "tensorboard"
+    runner.disable_logs = False
+    runner.is_distributed = True
+    runner.gpu_world_size = 2
+    runner.gpu_global_rank = 0
+    runner.num_steps_per_env = 1
+    runner.save_interval = 100
+    runner.current_learning_iteration = 0
+    runner.tot_timesteps = runner.tot_control_steps = runner.tot_time = 0
+    runner.dagger_update_freq = 20
+    runner.mean_hist_latent_loss = 0.
+    runner.privileged_obs_type = None
+    runner.obs_normalizer = torch.nn.Identity()
+    runner.empirical_normalization = False
+    runner.git_status_repos = []
+    runner.train_mode = lambda: None
+    runner.save = lambda *args: None
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    monkeypatch.setattr(sys.modules[OnPolicyRunnerWithExtractor.__module__], "store_code_state", lambda *args: [])
+
+    runner.learn_rl(2)
+
+    assert metrics["Train/control_steps"] == 23
+    assert metrics["Train/iteration"] == 1
+    assert metrics["Train/mean_reward"] == 50.
+    assert metrics["Train/mean_episode_length"] == 5.5
+    torch.testing.assert_close(torch.stack(processed_rewards), torch.tensor([[1., 2.], [3., 4.]]))
+
+
+def test_wandb_step_matches_existing_teacher_sampling_axis(tmp_path, monkeypatch):
+    """Long-lived W&B contract: Step permits overlaying the zero-based teacher run."""
+    import wandb
+    from modules.teacher_step_wandb_writer import TeacherStepWandbWriter
+
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+    writer = TeacherStepWandbWriter(str(tmp_path), 10, {"wandb_project": "parkour-budget-test"})
+    logged = []
+    monkeypatch.setattr(wandb, "log", lambda values, step: logged.append((values, step)))
+    for control_steps in [1, 5 * 147456 - 1, 10 * 147456]:
+        writer.control_steps = control_steps
+        writer.add_scalar("Train/control_steps", control_steps, global_step=0)
+    writer.close()
+    wandb.finish()
+    assert [step for values, step in logged] == [0, 4, 9]
+    assert [values["Train/control_steps"] for values, step in logged] == [1, 737279, 1474560]
 
 
 @pytest.mark.parametrize("per_minibatch", [False, True])

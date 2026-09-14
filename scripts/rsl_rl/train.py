@@ -198,6 +198,8 @@ def main(env_cfg: ParkourManagerBasedRLEnv |ManagerBasedRLEnvCfg | DirectRLEnvCf
         print(f"[INFO] Random latency policy; frozen decoder: {args_cli.latency_teacher_checkpoint}")
 
         latency_config = load_config(args_cli.latency_config)
+        if args_cli.distributed:
+            latency_config["latency"]["seed"] += 1009 * app_launcher.global_rank
         env = ParkourLatencyRslRlVecEnvWrapper(
             env,
             decoder,

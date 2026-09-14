@@ -143,6 +143,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
+        self.tot_control_steps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
@@ -161,9 +162,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "wandb":
-                from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+                from .teacher_step_wandb_writer import TeacherStepWandbWriter
 
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer = TeacherStepWandbWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
@@ -211,6 +212,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         for it in range(start_iter, tot_iter):
             start = time.time()
             hist_encoding = it % self.dagger_update_freq == 0
+            iteration_control_steps = torch.zeros((), dtype=torch.long, device=self.device)
 
             # Rollout
             with torch.inference_mode():
@@ -221,6 +223,14 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    if "latency_executed_steps" in infos:
+                        episode_steps = infos["latency_executed_steps"].to(self.device)
+                        episode_rewards = infos["latency_raw_reward"].to(self.device)
+                        iteration_control_steps += episode_steps.sum()
+                    else:
+                        episode_steps = 1
+                        episode_rewards = rewards
+                        iteration_control_steps += self.env.num_envs
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
@@ -256,13 +266,13 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                             ep_infos.append(infos["log"])
                         # Update rewards
                         if self.alg.rnd:
-                            cur_ereward_sum += rewards
+                            cur_ereward_sum += episode_rewards
                             cur_ireward_sum += intrinsic_rewards  # type: ignore
-                            cur_reward_sum += rewards + intrinsic_rewards
+                            cur_reward_sum += episode_rewards + intrinsic_rewards
                         else:
-                            cur_reward_sum += rewards
+                            cur_reward_sum += episode_rewards
                         # Update episode length
-                        cur_episode_length += 1
+                        cur_episode_length += episode_steps
                         # Clear data for completed episodes
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -277,6 +287,9 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
 
+                if self.is_distributed:
+                    torch.distributed.all_reduce(iteration_control_steps)
+                self.tot_control_steps += iteration_control_steps.item()
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
@@ -316,6 +329,13 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        if self.logger_type == "wandb":
+            self.writer.control_steps = self.tot_control_steps
+        self.writer.add_scalar("Train/control_steps", self.tot_control_steps, locs["it"])
+        self.writer.add_scalar("Train/iteration", locs["it"], locs["it"])
+        super().log(locs, width, pad)
 
     def learn_vision(self, num_learning_iterations, init_at_random_ep_len=False):
         if not isinstance(self.alg, DistillationWithExtractor):
@@ -560,6 +580,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
         if latency_checkpoint:
             saved_dict["latency_state_dict"] = self.env.latency_state_dict()
             saved_dict["rng_state"] = capture_rng_state()
+            saved_dict["total_control_steps"] = self.tot_control_steps
         # -- Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
@@ -628,6 +649,7 @@ class OnPolicyRunnerWithExtractor(OnPolicyRunner):
                 # Native checkpoints retain the original zero-based semantics.
                 self.current_learning_iteration = loaded_dict["iter"]
         if load_optimizer and "latency_state_dict" in loaded_dict:
+            self.tot_control_steps = loaded_dict["total_control_steps"]
             restore_rng_state(loaded_dict["rng_state"])
         return loaded_dict["infos"]
 
