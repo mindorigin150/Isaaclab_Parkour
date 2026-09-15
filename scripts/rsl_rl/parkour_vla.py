@@ -481,7 +481,7 @@ def _policy_observations(
 
     return [
         Observation(
-            # Official GR00T consumes the frame stack from metadata. Keeping
+            # StarVLA consumes the frame stack from metadata. Keeping
             # the legacy data carrier would pickle every RGB frame twice.
             data=None,
             env_step=step,
